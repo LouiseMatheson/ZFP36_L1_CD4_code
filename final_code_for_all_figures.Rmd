@@ -1,0 +1,3064 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+Load required packages
+======================
+
+Also set up theme for ggplot, and set default stringsAsFactors to F
+
+```{r}
+library(GenomicRanges)
+library(BSgenome.Mmusculus.UCSC.mm10)
+library(rtracklayer)
+library(RColorBrewer)
+library(DESeq2)
+library(gplots)
+library(pheatmap)
+library(pzfx)
+library(egg)
+library(rstatix)
+library(tidyverse)
+library(ggrepel)
+
+options(stringsAsFactors = F)
+
+theme_set(theme_classic()) 
+theme_update(plot.background = element_blank(), 
+             panel.background = element_blank(), 
+             legend.background = element_blank(), 
+             legend.key = element_blank())
+
+```
+
+
+Figure S1A - activation
+=======================
+
+Flow histograms generated in flowjo. Percentages of CD69+ cells are in "activation_status/surface markers.pzfx", table 1
+
+```{r fig.height=3.5, fig.width=3}
+read_pzfx("activation_status/surface markers.pzfx", 1) %>%
+  as_tibble() %>%
+  rename(Marker = ROWTITLE) %>%
+  gather(Sample, Percent_positive, -Marker) %>%
+  mutate(Genotype = sub(" *_[0-9]", "", Sample)) %>%
+  mutate(Genotype = factor(Genotype, levels = c("WT", "dKO"))) ->
+    Activation_markers_percent_positive
+
+Activation_markers_percent_positive %>%
+  filter(Marker == "CD69") %>%
+    ggplot(aes(x = Genotype, y = Percent_positive, shape = Genotype)) + 
+      stat_summary(geom = "crossbar", fun = "mean", fun.min = "mean", fun.max = "mean", width = 0.5, colour = "black") +
+      geom_jitter(height=0, width=0.2, size = 2.5) +
+      coord_cartesian(ylim = c(0,100)) +
+      scale_shape_manual(values = c(16,1)) +
+      ylab("Percentage of CD69 positive cells") +
+      theme(legend.position = "none")
+ggsave("Figure_panels/FigS1A_Percent_CD69.pdf", useDingbats = F)
+```
+
+Figure S1B - ZFP family qPCR
+============================
+
+Read in and merge graphpad tables for each ZFP36-family gene. Extract time and genotype from sample names, and filter for 24h.
+
+```{r}
+read_pzfx("timecourse_RNA_protein/121108 RNA TTP CD4-AB wt&cKO 0,24,48,72,96h.pzfx", 1) %>%
+  add_column(Gene = "Zfp36") ->
+    Zfp36_family_RNA
+
+read_pzfx("timecourse_RNA_protein/121108 RNA Tis11B CD4-AB wt&cKO 0,24,48,72,96h.pzfx", 1) %>%
+  add_column(Gene = "Zfp36l1") %>%
+    bind_rows(Zfp36_family_RNA) ->
+    Zfp36_family_RNA
+
+read_pzfx("timecourse_RNA_protein/121108 RNA Tis11D CD4-AB wt&cKO 0,24,48,72,96h.pzfx", 1) %>%
+  add_column(Gene = "Zfp36l2") %>%
+    bind_rows(Zfp36_family_RNA) ->
+    Zfp36_family_RNA
+
+Zfp36_family_RNA %>%
+  pivot_longer(-Gene, names_to = "Sample", values_to = "Abundance") %>%
+    mutate(Time = sub(".* ([0-9]+h)_[0-9]", "\\1", Sample)) %>%
+    mutate(Genotype = factor(grepl("wt", Sample), levels = c(T,F), labels = c("Ctrl", "dKO"))) %>%
+  filter(Time == "24h") ->
+      Zfp36_family_RNA
+
+```
+
+Normalise to mean in controls, so that scale for all genes is comparable
+
+Ie, we want to know the expression in KOs relative to expression in control (which will be set to 1)
+
+```{r}
+Zfp36_family_RNA %>%
+  group_by(Gene, Genotype) %>%
+  summarise(mean_abundance = mean(Abundance), .groups = "drop") %>%
+  unite(Condition, Gene, Genotype) ->
+    Zfp36_family_RNA_mean
+
+Zfp36_family_RNA %>%
+  mutate(Abundance_normMean = case_when(
+    Gene == "Zfp36" ~ Abundance/Zfp36_family_RNA_mean$mean_abundance[Zfp36_family_RNA_mean$Condition == "Zfp36_Ctrl"],
+    Gene == "Zfp36l1" ~ Abundance/Zfp36_family_RNA_mean$mean_abundance[Zfp36_family_RNA_mean$Condition == "Zfp36l1_Ctrl"],
+    Gene == "Zfp36l2" ~ Abundance/Zfp36_family_RNA_mean$mean_abundance[Zfp36_family_RNA_mean$Condition == "Zfp36l2_Ctrl"]
+  )) ->
+  Zfp36_family_RNA
+```
+
+
+Plot data 
+
+```{r fig.height=2, fig.width=4}
+Zfp36_family_RNA %>%
+  ggplot(aes(x = Gene, y = Abundance_normMean, fill = Genotype, shape = Genotype)) +
+    stat_summary(geom = "bar", fun = "mean", position = "dodge", colour = "black", size = 0.3) +
+    geom_point(position = position_jitterdodge(dodge.width = 0.9), size = 2) +
+    theme_bw() +
+    theme(panel.grid = element_blank(), legend.position = "right", legend.background = element_blank(), legend.title = element_blank(), plot.background = element_blank(), panel.background = element_blank()) +
+    scale_fill_manual(values = c("grey60", "white")) +
+    scale_shape_manual(values = c(19, 1)) +
+    scale_y_continuous(breaks = c(0, 0.5, 1))
+ggsave("Figure_panels/FigS1B_ZFPqPCR.pdf", useDingbats = F)
+```
+
+
+Figure 1A-D; MA plots
+=====================
+
+Read in counts for all
+----------------------
+
+I have raw counts for nascent mRNA, total mRNA and ribosome-protected mRNA. All quantified using Seqmonk, assuming single end, stranded data (opposing for nascent and total; same strand for Ribo-seq). For nascent and total used mRNA annotations, for Ribo-seq used CDS - all with merged isoforms. 
+
+One issue with the way Seqmonk merges isoforms (at least with v1.44.0) is that if they do not overlap, you can end up with two rows for a gene corresponding to different (groups of) isoforms. I have a file for the v90 annotation which indicates how to deal with each duplicate gene name - either add together, or discard one or other row (identified by coordinates). This was curated manually. 
+
+I also have a file containing some changes in gene name, since when the curation above was done, some isoforms had been updated to now be assigned to separate gene names. 
+
+First define function which takes the reads that have been read in and corrects the duplicate rows, and gene names, as defined by the file above. 
+
+It will also convert the counts into a dataframe suitable for input into DESeq2 - ie retain just the gene names as row names, and counts in each column. 
+
+Since some samples are unbalanced mixtures of sexes, we will also remove Y chromosome genes to avoid artefacts. Also remove Xist/Tsix and overlapping gene (Gm26992).
+
+```{r}
+
+RNA_seqmonk_to_corrected_counts <- function(expression_data){
+  GRCm38_v90_nomenclature <- read_tsv("Annotations/GRCm38_v90_nomenclature.txt", col_types = cols(Chromosome = col_character(), mRNA_duplicates = col_character()))
+  mRNA_duplication <- read_tsv("Annotations/duplicated_probe_in_mRNA.txt")
+  start_col <- which(colnames(expression_data) == "Distance") + 1 # the first column containing counts is the column following 'Distance' - not always same index!
+  GRCm38_name_changes <- GRCm38_v90_nomenclature[GRCm38_v90_nomenclature$name_change==T,]
+  expression_data$Gene_name <- expression_data$Probe
+  expression_data$gene_and_location <- paste(expression_data$Probe, expression_data$Chromosome,expression_data$Start, expression_data$End,expression_data$Probe_Strand)
+  expression_data$Gene_name[expression_data$gene_and_location %in% GRCm38_name_changes$gene_and_location] <- GRCm38_name_changes$Gene_name[match(expression_data$gene_and_location[expression_data$gene_and_location %in% GRCm38_name_changes$gene_and_location], GRCm38_name_changes$gene_and_location)]
+  GRCm38_name_changes <- GRCm38_name_changes[!GRCm38_name_changes$gene_and_location %in% expression_data$gene_and_location,]
+  expression_data$Gene_name[expression_data$Probe %in% GRCm38_name_changes$Probe] <- GRCm38_name_changes$Gene_name[match(expression_data$Probe[expression_data$Probe %in% GRCm38_name_changes$Probe], GRCm38_name_changes$Probe)]
+  expression_data <- expression_data[!expression_data$gene_and_location %in% mRNA_duplication$gene_and_location[mRNA_duplication$action=="exclude"],]
+  for(gene in na.omit(unique(mRNA_duplication$Probe[mRNA_duplication$action=="add"]))){
+    subset <- expression_data[expression_data$Probe == gene,]
+    expression_data$Start[expression_data$Probe == gene] <- min(subset$Start)
+    expression_data$End[expression_data$Probe == gene] <- max(subset$End)
+    for(i in start_col:(ncol(expression_data)-2)){
+      expression_data[expression_data$Probe == gene, i] <- sum(subset[,i])
+    }
+  }
+  expression_data <- expression_data[!duplicated(expression_data$Gene_name),]
+  expression_data <- expression_data[!(expression_data$Chromosome == "Y" | expression_data$Gene_name %in% c("Xist","Tsix","Gm26992")),]
+  expression_data %>%
+    distinct(Gene_name, .keep_all = T) %>%
+    filter(!(Chromosome == "Y" | Gene_name %in% c("Xist","Tsix","Gm26992"))) %>%
+    select(Gene_name, start_col:(ncol(expression_data)-2)) %>% # up to the last column of the original dataframe - 2 additonal columns added above
+    column_to_rownames("Gene_name")
+  }
+
+```
+
+Read in raw counts for each dataset, and correct using the function above
+
+```{r}
+read_tsv("Raw_counts_Seqmonk/RNA_dKO_raw_counts.txt", col_types = cols(Chromosome = col_character())) %>%
+  rename_with(~ gsub(" ", "_", .x)) %>%
+  RNA_seqmonk_to_corrected_counts() -> RNA_raw_counts_corrected
+
+read_tsv("Raw_counts_Seqmonk/Nascent_raw_counts.txt", col_types = cols(Chromosome = col_character())) %>%
+  rename_with(~ gsub(" ", "_", .x)) %>%
+  RNA_seqmonk_to_corrected_counts() -> raw_counts_nascent_corrected
+
+read_tsv("Raw_counts_Seqmonk/Ribo_cds_raw_counts.txt", col_types = cols(Chromosome = col_character())) %>%
+  rename_with(~ gsub(" ", "_", .x)) %>%
+  RNA_seqmonk_to_corrected_counts() -> Riboseq_raw_counts_corrected
+```
+Warnings for RiboSeq are because some genes with duplicate names don't have a CDS so the subsets are empty - but equally there are no values to replace so this does not matter. 
+
+Simplify column names - in the case of nascent and total RNA I have tables to read in which define which sample is which since the names are not descriptive. 
+
+```{r}
+read_tsv("Raw_counts_Seqmonk/RNA_dKO_samples.txt") -> RNA_dKO_samples
+colnames(RNA_raw_counts_corrected)[match(RNA_dKO_samples$Bam_name,colnames(RNA_raw_counts_corrected))] <- RNA_dKO_samples$Sample_name
+
+read_tsv("Raw_counts_Seqmonk/Nascent_samples.txt") %>%
+  mutate(geno = if_else(geno == "wt", "Ctrl", "KO")) %>%
+  unite(sample_name, geno, desc, expt) %>%
+  mutate(sample_name = sub("-e", "E", sample_name)) -> Nascent_samples
+
+colnames(raw_counts_nascent_corrected)[match(Nascent_samples$sample.id,gsub("-", ".", colnames(raw_counts_nascent_corrected)))] <- Nascent_samples$sample_name
+
+colnames(Riboseq_raw_counts_corrected) <- sub("lane._(RF_...)_[ACGT].*","\\1", colnames(Riboseq_raw_counts_corrected))
+
+```
+
+Limit analysis to only include genes with a CDS, ie those that are in the Ribo-seq as well as other datasets.
+
+```{r}
+summary(rownames(RNA_raw_counts_corrected) %in% rownames(raw_counts_nascent_corrected))
+#   Mode    TRUE 
+#logical   33456 
+summary(rownames(Riboseq_raw_counts_corrected) %in% rownames(raw_counts_nascent_corrected))
+#   Mode   FALSE    TRUE 
+#logical     253   21985 
+### These are all Ig segments
+
+summary(rownames(raw_counts_nascent_corrected) %in% rownames(Riboseq_raw_counts_corrected))
+#   Mode   FALSE    TRUE 
+#logical   11471   21985 
+
+```
+Nascent and total RNA have exactly the same genes represented (as would be expected since both based on mRNA annotations). 
+
+Limit nascent and total RNA to only genes present in Riboseq
+Limit Riboseq to only genes present in total RNAseq. 
+
+
+```{r}
+RNA_raw_counts_complete <- RNA_raw_counts_corrected[rownames(RNA_raw_counts_corrected) %in% rownames(Riboseq_raw_counts_corrected),]
+Nascent_raw_counts_complete <- raw_counts_nascent_corrected[rownames(raw_counts_nascent_corrected) %in% rownames(Riboseq_raw_counts_corrected),]
+Ribo_raw_counts_complete <- Riboseq_raw_counts_corrected[rownames(Riboseq_raw_counts_corrected) %in% rownames(RNA_raw_counts_corrected),]
+
+```
+
+
+DESeq2 analysis of total RNA-seq
+---------------------------------
+
+Create coldata and run DESeq2 for total RNA-seq
+
+Extract normalised counts, and output from LFCshrink for KO vs Ctrl comparison, with normal LFC shrinkage.
+
+```{r}
+tibble(sample = colnames(RNA_raw_counts_complete)) %>%
+  mutate(Genotype = if_else(grepl("Ctrl", sample), "Ctrl", "KO")) %>%
+  column_to_rownames("sample") -> coldata_RNA
+
+RNA_raw_counts_complete %>%
+  DESeqDataSetFromMatrix(coldata_RNA, design = ~Genotype) %>%
+  DESeq() -> dds_RNA
+
+counts(dds_RNA, normalized = T) %>%
+  as_tibble(rownames = "Gene") -> norm_counts_RNA
+dds_RNA %>%
+  lfcShrink(coef = 2, type = "normal") %>%
+  as_tibble(rownames = "Gene") -> res_RNA
+
+```
+For norm_counts_RNA, add a column with the log2 mean in control cells - used to give indication of relative expression levels in some later figures. 
+
+```{r}
+norm_counts_RNA %>% 
+  mutate(Ctrl_mean = rowMeans(log2(select(., contains("Ctrl"))+1))) -> norm_counts_RNA
+```
+
+### Table S1 - mRNA DE genes
+
+Export significantly altered genes for supplementary table (increased and decreased separately):
+
+```{r}
+res_RNA %>% 
+  filter(baseMean > 10) %>%
+  filter(padj < 0.05) %>%
+  filter(log2FoldChange > 0) %>%
+  arrange(padj) %>%
+  write_tsv("Supplementary_tables/TableS1_RNAincreased.txt")
+
+res_RNA %>% 
+  filter(baseMean > 10) %>%
+  filter(padj < 0.05) %>%
+  filter(log2FoldChange < 0) %>%
+  arrange(padj) %>%
+  write_tsv("Supplementary_tables/TableS1_RNAdecreased.txt")
+```
+
+
+
+Nascent/4sU-labelled mRNA
+-------------------------
+
+For nascent, replicates 1 and 2 were done independently and should be included as a batch effect. 
+
+In this dataset, I have counts for the total, labelled (nascent) and unlabelled (pre-existing) fractions. For nascent RNA, I can simply run DESeq2 on the counts from the nascent fraction. But for estimating stability, I will also need normalised read counts for pre-existing and total fractions so run DESeq2 for these as well (although no need to extract results, just norm counts)
+
+```{r}
+raw_counts_4sU <- Nascent_raw_counts_complete[,grepl("4sU",colnames(Nascent_raw_counts_complete))]
+raw_counts_total <- Nascent_raw_counts_complete[,grepl("total",colnames(Nascent_raw_counts_complete))]
+raw_counts_preEx <- Nascent_raw_counts_complete[,grepl("preEx",colnames(Nascent_raw_counts_complete))]
+
+coldata_4sU <- data.frame(row.names = colnames(raw_counts_4sU),Genotype = factor(grepl("Ctrl",colnames(raw_counts_4sU)),levels = c(T,F),labels = c("Ctrl","KO")),Batch = factor(grepl("1",colnames(raw_counts_4sU)),levels = c(T,F),labels = c("A","B")))
+coldata_total <- data.frame(row.names = colnames(raw_counts_total),Genotype = factor(grepl("Ctrl",colnames(raw_counts_total)),levels = c(T,F),labels = c("Ctrl","KO")),Batch = factor(grepl("1",colnames(raw_counts_total)),levels = c(T,F),labels = c("A","B")))
+coldata_preEx <- data.frame(row.names = colnames(raw_counts_preEx),Genotype = factor(grepl("Ctrl",colnames(raw_counts_preEx)),levels = c(T,F),labels = c("Ctrl","KO")),Batch = factor(grepl("1",colnames(raw_counts_preEx)),levels = c(T,F),labels = c("A","B")))
+
+DESeqDataSetFromMatrix(raw_counts_4sU, colData = coldata_4sU, design = ~Batch+Genotype) %>%
+  DESeq() -> dds_4sU
+DESeqDataSetFromMatrix(raw_counts_total, colData = coldata_total, design = ~Batch+Genotype) %>%
+  DESeq() -> dds_total
+DESeqDataSetFromMatrix(raw_counts_preEx, colData = coldata_preEx, design = ~Batch+Genotype) %>%
+  DESeq() -> dds_preEx
+
+counts(dds_4sU, normalized = T) %>%
+  as_tibble(rownames = "Gene") -> norm_counts_4sU
+counts(dds_total, normalized = T) %>%
+  as_tibble(rownames = "Gene") -> norm_counts_total
+counts(dds_preEx, normalized = T) %>%
+  as_tibble(rownames = "Gene") -> norm_counts_preEx
+
+dds_4sU %>%
+  lfcShrink(coef = 3, type = "normal") %>%
+  as_tibble(rownames = "Gene") -> res_4sU
+
+
+```
+
+### Table S2 - newly synthesised DE genes
+
+Export significantly altered for supplemetary table - using padj < 0.1 for some analyses so include all of these.
+
+```{r}
+res_4sU %>% 
+  filter(baseMean > 10) %>%
+  filter(padj < 0.1) %>%
+  filter(log2FoldChange > 0) %>%
+  arrange(padj) %>%
+  write_tsv("Supplementary_tables/TableS2_4sUincreased.txt")
+
+res_4sU %>% 
+  filter(baseMean > 10) %>%
+  filter(padj < 0.1) %>%
+  filter(log2FoldChange < 0) %>%
+  arrange(padj) %>%
+  write_tsv("Supplementary_tables/TableS2_4sUdecreased.txt")
+```
+
+
+
+Stability
+----------
+
+First need to calculate correction factors based on pre-existing, total and nascent normalised counts. 
+
+I will calculate these for each genotype/replicate separately, and then take the average. 
+
+For each, need the ratios between pre-existing:total and nascent:total, then fit a linear model between them. The coefficients from the linear model can then be used to calculate the correction factors (see supplementary methods from DOI: 10.1261/rna.1136108)
+
+```{r}
+norm_counts_4sU %>%
+  left_join(norm_counts_preEx) %>%
+  left_join(norm_counts_total) -> norm_counts_all_4sU
+
+norm_counts_all_4sU$ratioPT_C1 <- norm_counts_all_4sU$Ctrl_preEx_1/norm_counts_all_4sU$Ctrl_total_1
+norm_counts_all_4sU$ratioPT_C2 <- norm_counts_all_4sU$Ctrl_preEx_2/norm_counts_all_4sU$Ctrl_total_2
+norm_counts_all_4sU$ratioPT_K1 <- norm_counts_all_4sU$KO_preEx_1/norm_counts_all_4sU$KO_total_1
+norm_counts_all_4sU$ratioPT_K2 <- norm_counts_all_4sU$KO_preEx_2/norm_counts_all_4sU$KO_total_2
+
+norm_counts_all_4sU$ratioNT_C1 <- norm_counts_all_4sU$Ctrl_4sU_1/norm_counts_all_4sU$Ctrl_total_1
+norm_counts_all_4sU$ratioNT_C2 <- norm_counts_all_4sU$Ctrl_4sU_2/norm_counts_all_4sU$Ctrl_total_2
+norm_counts_all_4sU$ratioNT_K1 <- norm_counts_all_4sU$KO_4sU_1/norm_counts_all_4sU$KO_total_1
+norm_counts_all_4sU$ratioNT_K2 <- norm_counts_all_4sU$KO_4sU_2/norm_counts_all_4sU$KO_total_2
+
+
+lm_4sU_C1 <- lm(ratioPT_C1 ~ ratioNT_C1, norm_counts_all_4sU[is.finite(norm_counts_all_4sU$ratioNT_C1 + norm_counts_all_4sU$ratioNT_C1),])
+C1_Pnorm <- 1/lm_4sU_C1$coefficients[1]
+C1_Nnorm <- -lm_4sU_C1$coefficients[2]*C1_Pnorm
+
+lm_4sU_C2 <- lm(ratioPT_C2 ~ ratioNT_C2, norm_counts_all_4sU[is.finite(norm_counts_all_4sU$ratioNT_C2 + norm_counts_all_4sU$ratioNT_C2),])
+C2_Pnorm <- 1/lm_4sU_C2$coefficients[1]
+C2_Nnorm <- -lm_4sU_C2$coefficients[2]*C2_Pnorm
+
+lm_4sU_K1 <- lm(ratioPT_K1 ~ ratioNT_K1, norm_counts_all_4sU[is.finite(norm_counts_all_4sU$ratioNT_K1 + norm_counts_all_4sU$ratioNT_K1),])
+K1_Pnorm <- 1/lm_4sU_K1$coefficients[1]
+K1_Nnorm <- -lm_4sU_K1$coefficients[2]*K1_Pnorm
+
+lm_4sU_K2 <- lm(ratioPT_K2 ~ ratioNT_K2, norm_counts_all_4sU[is.finite(norm_counts_all_4sU$ratioNT_K2 + norm_counts_all_4sU$ratioNT_K2),])
+K2_Pnorm <- 1/lm_4sU_K2$coefficients[1]
+K2_Nnorm <- -lm_4sU_K2$coefficients[2]*K2_Pnorm
+
+# then take average norm factor for newly transcribed to use below
+norm_factor_newlyTranscribed <- median(c(C1_Nnorm, C2_Nnorm, K1_Nnorm, K2_Nnorm))
+```
+Now calculate relative stability from the nascent and total counts, using the correction factor calculated above
+
+```{r}
+norm_counts_all_4sU$Ctrl_relative_stability_1 <- -log(2)/(log(1-((norm_counts_all_4sU$Ctrl_4sU_1*norm_factor_newlyTranscribed)/norm_counts_all_4sU$Ctrl_total_1)))
+norm_counts_all_4sU$Ctrl_relative_stability_2 <- -log(2)/(log(1-((norm_counts_all_4sU$Ctrl_4sU_2*norm_factor_newlyTranscribed)/norm_counts_all_4sU$Ctrl_total_2)))
+
+norm_counts_all_4sU$KO_relative_stability_1 <- -log(2)/(log(1-((norm_counts_all_4sU$KO_4sU_1*norm_factor_newlyTranscribed)/norm_counts_all_4sU$KO_total_1)))
+norm_counts_all_4sU$KO_relative_stability_2 <- -log(2)/(log(1-((norm_counts_all_4sU$KO_4sU_2*norm_factor_newlyTranscribed)/norm_counts_all_4sU$KO_total_2)))
+
+norm_counts_all_4sU$Ctrl_log_stability_1 <- log2(norm_counts_all_4sU$Ctrl_relative_stability_1)
+norm_counts_all_4sU$Ctrl_log_stability_2 <- log2(norm_counts_all_4sU$Ctrl_relative_stability_2)
+norm_counts_all_4sU$KO_log_stability_1 <- log2(norm_counts_all_4sU$KO_relative_stability_1)
+norm_counts_all_4sU$KO_log_stability_2 <- log2(norm_counts_all_4sU$KO_relative_stability_2)
+```
+
+NaNs are from 0s - will remove non-finite after calculating differences below.
+
+Calculate difference between stability in KO vs Ctrl for the replicates separately (since there was a substantial batch effect between the two experiments), standardised to s.d.
+Then mean change in stability
+
+```{r}
+norm_counts_all_4sU$stability_shift_1 <- norm_counts_all_4sU$KO_log_stability_1 - norm_counts_all_4sU$Ctrl_log_stability_1
+norm_counts_all_4sU$stability_shift_2 <- norm_counts_all_4sU$KO_log_stability_2 - norm_counts_all_4sU$Ctrl_log_stability_2
+
+norm_counts_all_4sU$standardised_stability_shift_1 <- norm_counts_all_4sU$stability_shift_1/sd(norm_counts_all_4sU$stability_shift_1,na.rm = T)
+norm_counts_all_4sU$standardised_stability_shift_2 <- norm_counts_all_4sU$stability_shift_2/sd(norm_counts_all_4sU$stability_shift_2,na.rm = T)
+
+norm_counts_all_4sU$standardised_stability_shift_mean <- rowMeans(as.matrix(norm_counts_all_4sU[,grepl("standardised_stability_shift_[12]", colnames(norm_counts_all_4sU))]))
+
+# create new dataframe containing stability differences, into which we'll add additional stats etc
+Stability_differences <- data.frame(Gene = res_4sU$Gene)
+
+Stability_differences$Stability_shift <- norm_counts_all_4sU$standardised_stability_shift_mean[match(Stability_differences$Gene, norm_counts_all_4sU$Gene)]
+
+Stability_differences <- Stability_differences[is.finite(Stability_differences$Stability_shift),]
+
+```
+
+To identify statistically significant differences between KO and Ctrl, will use intensityDifference function (see intensityDifference.R). Originally by Simon Andrews (https://github.com/s-andrews/intensitydiff), version used here is modified to allow 'averages' and 'differences' to be provided directly, rather than calculated from separate data for Ctrl and KO. 
+
+It calculates z-scores for the differences based on the local standard deviation of the expression levels, since the amount of noise decreases as expression increases. Ie, low expressed genes are penalised more. In this case, we need to provide the averages and differences separately, because the averages are average stability, whilst the local standard deviation should be based on expression (since things with similar stability are not necessarily of similar expression level, and we wouldn't expect any particular correlation between stability and noise). For the 'averages', I will use the mean normalised read counts across nascent (columns 2:5 in norm_counts_all_4sU) and total (columns 10:13 of norm_counts_all_4sU). For differences I will use the mean standardised stability shift calculated above.
+
+```{r}
+source("intensityDifference.R")
+
+Stability_differences$mean_total4sU <- rowMeans(norm_counts_all_4sU[match(Stability_differences$Gene, norm_counts_all_4sU$Gene), c(2:5, 10:13)])
+
+Stability_differences <- cbind(Stability_differences, intensity.difference(averages = Stability_differences$mean_total4sU, differences = Stability_differences$Stability_shift))
+
+```
+
+### Table S3 - genes with altered stability
+
+Export genes with absolute z-score > 2 for supplementary table
+
+```{r}
+Stability_differences %>% 
+  filter(average.intensity > 10) %>%
+  filter(z.score > 2) %>%
+  arrange(desc(z.score)) %>%
+  select(Gene, mean_total4sU, Stability_shift, local.sd, p.value, fdr.value, z.score) %>%
+  write_tsv("Supplementary_tables/TableS3_stabincreased.txt")
+
+Stability_differences %>% 
+  filter(average.intensity > 10) %>%
+  filter(z.score < -2) %>%
+  arrange(z.score) %>%
+  select(Gene, mean_total4sU, Stability_shift, local.sd, p.value, fdr.value, z.score) %>%
+  write_tsv("Supplementary_tables/TableS3_stabdecreased.txt")
+```
+
+Ribo-seq
+---------
+
+For Riboseq, replicates were processed in 2 batches: replicates 1 and 2 in the first batch, and 3-5 in the second. This will be included in coldata and as a batch effect in the DESeq2 analysis. 
+
+```{r}
+coldata_Ribo <- data.frame(row.names = colnames(Ribo_raw_counts_complete),Genotype = factor(grepl("WT",colnames(Ribo_raw_counts_complete)),levels = c(T,F),labels = c("Ctrl","KO")),Batch = factor(as.numeric(gsub(".*([0-9])$", "\\1", colnames(Ribo_raw_counts_complete))) %in% c(1,2),levels = c(T,F),labels = c("A","B")))
+
+DESeqDataSetFromMatrix(Ribo_raw_counts_complete, colData = coldata_Ribo, design = ~Batch+Genotype) %>%
+  DESeq() -> dds_Ribo
+
+counts(dds_Ribo, normalized = T) %>%
+  as_tibble(rownames = "Gene") -> norm_counts_Ribo
+
+lfcShrink(dds_Ribo, coef = 3, type = "normal") %>%
+  as_tibble(rownames = "Gene") -> res_Ribo
+
+```
+
+### Table S4 - Riboseq DE genes
+
+Export signficant genes for supplementary table
+
+```{r}
+res_Ribo %>% 
+  filter(baseMean > 10) %>%
+  filter(padj < 0.05) %>%
+  filter(log2FoldChange > 0) %>%
+  arrange(padj) %>%
+  write_tsv("Supplementary_tables/TableS4_Riboincreased.txt")
+
+res_Ribo %>% 
+  filter(baseMean > 10) %>%
+  filter(padj < 0.05) %>%
+  filter(log2FoldChange < 0) %>%
+  arrange(padj) %>%
+  write_tsv("Supplementary_tables/TableS4_Ribodecreased.txt")
+```
+
+Generate plots
+--------------
+
+I also want to highlight genes that are cytokines, so first read in list of cytokine/chemokine genes
+
+
+
+```{r fig.height=5, fig.width=7}
+Cytokine_genes <- read.table("Annotations/Cytokine_genes.txt")$V1
+
+res_RNA %>%
+  mutate(Cytokine = Gene %in% Cytokine_genes) -> res_RNA
+res_4sU %>%
+  mutate(Cytokine = Gene %in% Cytokine_genes) -> res_4sU
+res_Ribo %>%
+  mutate(Cytokine = Gene %in% Cytokine_genes) -> res_Ribo
+Stability_differences %>%
+  mutate(Cytokine = Gene %in% Cytokine_genes) -> Stability_differences
+
+res_RNA %>%
+  arrange(Cytokine) %>%
+  filter(baseMean > 10 & !is.na(padj)) %>%
+  ggplot(aes(x = baseMean, y = log2FoldChange)) + 
+    geom_point(aes(colour = padj < 0.001), size = 1.5) + 
+    geom_point(data = filter(res_RNA, baseMean > 10 & !is.na(padj) & Cytokine == TRUE), shape = 1, size = 1.8) +
+    geom_text_repel(data = res_RNA[res_RNA$Gene %in% c(Cytokine_genes, "Zfp36","Zfp36l1") & res_RNA$padj < 0.001 & abs(res_RNA$log2FoldChange) > 0.25,], aes(label = Gene), min.segment.length = 0)  + 
+    scale_x_log10(breaks = c(10,100,1000,10000, 100000)) + 
+    scale_colour_manual(name = "fdr0.001",values = c("grey70","mediumturquoise")) + 
+    labs(title = "Total mRNA", x = "Mean expression (normalised read counts)", y = "Log2 fold change in expression") + 
+    coord_cartesian(ylim = c(-5,5))
+ggsave("Figure_panels/Fig1A_MA_RNA.pdf", useDingbats = F)
+
+res_Ribo %>%
+  filter(baseMean > 10 & !is.na(padj)) %>%
+  ggplot(aes(x = baseMean, y = log2FoldChange)) + 
+    geom_point(aes(colour = padj < 0.05), size = 1.5) + 
+    geom_point(data = filter(res_Ribo, baseMean > 10 & !is.na(padj) & Cytokine == TRUE), shape = 1, size = 1.8) + 
+    geom_text(data = res_Ribo[res_Ribo$Gene %in% c(Cytokine_genes, "Zfp36","Zfp36l1") & res_Ribo$padj < 0.05 & res_Ribo$baseMean > 10,], aes(label = Gene), hjust = 0, nudge_x = 0.04)  + 
+    scale_x_log10(breaks = c(10,100,1000,10000, 100000)) + 
+    scale_colour_manual(name = "fdr0.05",values = c("grey70","mediumturquoise")) + 
+    labs(title = "Ribosome-protected mRNA", x = "Mean expression (normalised read counts)", y = "Log2 fold change in expression") + 
+    coord_cartesian(ylim = c(-2.1,2.1))
+ggsave("Figure_panels/Fig1D_MA_Ribo.pdf", useDingbats = F)
+
+res_4sU %>%
+  filter(baseMean > 10 & !is.na(padj)) %>%
+    ggplot(aes(x = baseMean, y = log2FoldChange)) + 
+      geom_point(aes(colour = padj < 0.1), size = 1.5) + 
+      geom_point(data = filter(res_4sU, baseMean > 10 & !is.na(padj) & Cytokine == TRUE), shape = 1, size = 1.8) + 
+      geom_text(data = res_4sU[res_4sU$Gene %in% c(Cytokine_genes, "Zfp36","Zfp36l1") & res_4sU$padj < 0.1,], aes(label = Gene), hjust = 0, nudge_x = 0.04)  + 
+      scale_x_log10(breaks = c(10,100,1000,10000, 100000)) + 
+      scale_colour_manual(name = "fdr0.1", values = c("grey70","mediumturquoise"))  + 
+      labs(title = "Nascent mRNA", x = "Mean expression (normalised read counts)", y = "Log2 fold change in expression") +
+      coord_cartesian(ylim = c(-3.9,3.9)) 
+ggsave("Figure_panels/Fig1B_MA_4sU.pdf", useDingbats = F)
+
+Stability_differences %>%
+  filter(average.intensity > 10) %>%
+    ggplot(aes(x = mean_total4sU, y = z.score)) + 
+      geom_point(aes(colour = abs(z.score) > 2))  + 
+      geom_point(data = filter(Stability_differences, average.intensity > 10 & Cytokine == TRUE), shape = 1, size = 1.8) + 
+      scale_x_log10(breaks = c(10,100,1000,10000, 100000)) + 
+      scale_colour_manual(name = "z>2",values = c("grey70","mediumturquoise"))+ 
+      geom_text(data = Stability_differences[Stability_differences$Cytokine == T & abs(Stability_differences$z.score) > 2,], aes(label = Gene), hjust = 0, colour = "black", nudge_x = 0.04)  + 
+      labs(title = "RNA stability", x = "Mean expression (total and nascent; normalised read counts)", y = "Change in stability (z score)") + 
+      coord_cartesian(ylim = c(-8.5,8.5))
+ggsave("Figure_panels/Fig1C_MA_stability.pdf", useDingbats = F)
+
+```
+
+
+Figure 1E - TNF, IFNg and IL2 measurements
+==========================================
+
+Read in graphpad files, combine and convert to long format with appropriate grouping columns
+
+```{r fig.height=5, fig.width=6}
+as_tibble(read_pzfx("timecourse_RNA_protein/150409 RNA+protein IL2,TNF,IFNg CD4-AB wt&cKO 0-96h.pzfx", "TNF RNA")) %>%
+  add_column(Cytokine = "TNF", Dataset = "RNA") ->
+    TNF_IFNg_IL2 
+
+as_tibble(read_pzfx("timecourse_RNA_protein/150409 RNA+protein IL2,TNF,IFNg CD4-AB wt&cKO 0-96h.pzfx", "IFNg RNA")) %>%
+  add_column(Cytokine = "IFNg", Dataset = "RNA") %>%
+  bind_rows(TNF_IFNg_IL2) ->
+    TNF_IFNg_IL2 
+
+as_tibble(read_pzfx("timecourse_RNA_protein/150409 RNA+protein IL2,TNF,IFNg CD4-AB wt&cKO 0-96h.pzfx", "TNF protein")) %>%
+  add_column(Cytokine = "TNF", Dataset = "Protein") %>%
+  bind_rows(TNF_IFNg_IL2) ->
+    TNF_IFNg_IL2 
+
+as_tibble(read_pzfx("timecourse_RNA_protein/150409 RNA+protein IL2,TNF,IFNg CD4-AB wt&cKO 0-96h.pzfx", "IFNg protein")) %>%
+  add_column(Cytokine = "IFNg", Dataset = "Protein") %>%
+  bind_rows(TNF_IFNg_IL2) ->
+    TNF_IFNg_IL2 
+
+as_tibble(read_pzfx("timecourse_RNA_protein/150409 RNA+protein IL2,TNF,IFNg CD4-AB wt&cKO 0-96h.pzfx", "IL2 RNA")) %>%
+  add_column(Cytokine = "IL2", Dataset = "RNA") %>%
+  bind_rows(TNF_IFNg_IL2) ->
+    TNF_IFNg_IL2 
+
+as_tibble(read_pzfx("timecourse_RNA_protein/150409 RNA+protein IL2,TNF,IFNg CD4-AB wt&cKO 0-96h.pzfx", "IL2 protein")) %>%
+  add_column(Cytokine = "IL2", Dataset = "Protein") %>%
+  bind_rows(TNF_IFNg_IL2) ->
+    TNF_IFNg_IL2 
+
+
+TNF_IFNg_IL2 %>%
+  pivot_longer(-c(Cytokine, Dataset), names_to = "Sample", values_to = "Quantity") %>%
+    mutate(Time = sub(".* (.*?)_.*", "\\1", Sample)) %>%
+    mutate(Genotype = factor(grepl("wt", Sample), levels = c(T,F), labels = c("Ctrl", "dKO"))) %>%
+    mutate(Dataset = factor(Dataset, levels = c("RNA", "Protein"))) %>%
+    mutate(Cytokine = factor(Cytokine, levels = c("IFNg", "TNF", "IL2"))) ->
+      TNF_IFNg_IL2
+
+
+```
+
+Normalise to mean quantity in controls at 0h. This can only be done for RNA - protein levels are 0 for both cytokines at 0h, so leave these are they are.
+
+```{r fig.height=5, fig.width=6}
+TNF_IFNg_IL2 %>%
+  group_by(Dataset, Cytokine, Genotype, Time) %>%
+  summarise(mean_quantity = mean(Quantity)) %>%
+  ungroup %>%
+  unite(Condition, Dataset, Cytokine, Genotype, Time) ->
+    TNF_IFNg_IL2_mean
+
+
+TNF_IFNg_IL2 %>%
+  mutate(Quantity_normMean = case_when(
+    Dataset == "RNA" & Cytokine == "IFNg" ~ Quantity/TNF_IFNg_IL2_mean$mean_quantity[TNF_IFNg_IL2_mean$Condition == "RNA_IFNg_Ctrl_0h"],
+    Dataset == "RNA" & Cytokine == "TNF" ~ Quantity/TNF_IFNg_IL2_mean$mean_quantity[TNF_IFNg_IL2_mean$Condition == "RNA_TNF_Ctrl_0h"],
+    Dataset == "RNA" & Cytokine == "IL2" ~ Quantity/TNF_IFNg_IL2_mean$mean_quantity[TNF_IFNg_IL2_mean$Condition == "RNA_IL2_Ctrl_0h"],
+    TRUE ~ Quantity
+  )) ->
+  TNF_IFNg_IL2
+```
+
+Plot on log scale. For protein, there are 0 values - convert these to 1 but plot as downward facing triangles to indicate they are off the scale. 
+
+```{r fig.height=3.5, fig.width=7.5}
+TNF_IFNg_IL2 %>% 
+  mutate(Genotype_no0 = case_when(
+    Genotype == "Ctrl" & Quantity == 0 ~ "Ctrl_0",
+    Genotype == "dKO" & Quantity == 0 ~ "dKO_0",
+    TRUE ~ as.character(Genotype)
+  )) %>%
+  mutate(Genotype_no0 = factor(Genotype_no0, levels = c("Ctrl", "dKO", "Ctrl_0", "dKO_0"))) %>%
+  mutate(Quantity_no0 = if_else(Quantity == 0, 1, Quantity_normMean)) %>%
+  ggplot(aes(x = Time, y = Quantity_no0, shape = Genotype_no0, fill = Genotype, group = Genotype)) +
+    stat_summary(geom = "bar", fun = "mean", position = position_dodge(width = 0.9), colour = "black", size = 0.3) +
+    geom_point(position = position_jitterdodge(dodge.width = 0.9), fill = "black") +
+    facet_grid(Dataset ~ Cytokine, scales = "free") + 
+    theme_bw() +
+    scale_fill_manual(values = c("grey60", "white")) +
+    scale_shape_manual(guide = "none", values = c(19,1, 25, 6)) +
+    theme(legend.background = element_blank(), legend.title = element_blank(), panel.grid = element_blank()) +
+    labs(x = "Time after activation", y = "Relative abundance") +
+    scale_y_log10() +
+    theme(panel.grid.major.y = element_line(colour = "grey70"), legend.background = element_blank(), legend.key = element_blank())
+ggsave("Figure_panels/Fig1E_IFNgTNFIL2_measurements.pdf")
+
+```
+
+
+
+Figure 2A-B - clustered heatmap 
+===============================
+
+Make combined L2FC for each (or z-scores for stability) into a single dataframe.
+
+For all except stability (which are already z-scores), calculate z-scores based on overall standard deviation. Since these are shrunken L2FC, the increased noise at low expression levels is already taken into account so no need to use local s.d. for this. 
+
+```{r}
+all_fold_change <- data.frame(Gene = res_RNA$Gene, RNA_L2FC = res_RNA$log2FoldChange)
+
+all_fold_change$Ribo_L2FC <- res_Ribo$log2FoldChange[match(all_fold_change$Gene, res_Ribo$Gene)]
+all_fold_change$Nascent_L2FC <- res_4sU$log2FoldChange[match(all_fold_change$Gene, res_4sU$Gene)]
+all_fold_change$Stability_change <- Stability_differences$z.score[match(all_fold_change$Gene, Stability_differences$Gene)]
+
+
+all_L2FC_norm <- data.frame(Gene = all_fold_change$Gene, RNA_zscore = all_fold_change$RNA_L2FC/sd(all_fold_change$RNA_L2FC, na.rm = T), Ribo_zscore = all_fold_change$Ribo_L2FC/sd(all_fold_change$Ribo_L2FC, na.rm = T), Nascent_zscore= all_fold_change$Nascent_L2FC/sd(all_fold_change$Nascent_L2FC, na.rm = T), Stability_zscore = all_fold_change$Stability_change)
+
+```
+
+Since the different datasets have very different sensitivity in detecting significant differences (it might also be in part that there are more differences in RNA abundance than in the other measures - but the nascent and RiboSeq datasets also look generally more noisy), I will use different thresholds for each dataset to decide which genes to include in this analysis. This is so that we have representation of a reasonably large set of genes that show the greatest evidence for changing in each of the measures. The chosen thresholds are:
+
+* Nascent mRNA - adjusted p value < 0.1
+* Stability - z score > 2
+* mRNA abundance - adjusted p value < 0.001
+* Ribosome protected mRNA - adjusted p value < 0.05
+
+I will exclude Zfp36/l1 (which have an apparent increase in stability); also exclude any gene which does not have a finite L2FC for all the measures. 
+
+Clustering for genes is done on z-scores, only including nascent, stability and Riboseq (since these are the most mechanistically interesting), and uses 1-correlation coefficient as a distance metric (datasets are not clustered).
+
+```{r fig.height=6, fig.width=10}
+up_all_L2FC <- all_L2FC_norm[all_L2FC_norm$Gene %in% c(res_RNA$Gene[res_RNA$padj < 0.001 & res_RNA$log2FoldChange > 0 & res_RNA$baseMean > 10], res_4sU$Gene[res_4sU$padj < 0.1 & res_4sU$log2FoldChange > 0 & res_4sU$baseMean > 10],  res_Ribo$Gene[res_Ribo$padj < 0.05 & res_Ribo$log2FoldChange > 0 & res_Ribo$baseMean > 10],  Stability_differences$Gene[Stability_differences$z.score > 2 & Stability_differences$average.intensity > 10]),c(1:5)]
+
+up_all_L2FC <- up_all_L2FC[!up_all_L2FC$Gene %in% c("Zfp36", "Zfp36l1"),]
+up_all_L2FC <- na.omit(up_all_L2FC)
+
+up_all_cor <- cor(t(up_all_L2FC[,3:5]))
+
+up_all_distCor <- as.dist(1-up_all_cor)
+
+up_all_hcCor <- hclust(up_all_distCor)
+up_all_L2FC$clustersCor <- cutree(up_all_hcCor,5)
+up_all_L2FC$clusterColCor <- as.character(factor(up_all_L2FC$clustersCor, levels = c(1:5), labels =c("cornflowerblue","mediumpurple", "firebrick", "darkturquoise", "lightgoldenrod")))
+
+up_all_L2FC_hm <- up_all_L2FC[,3:5]
+
+#pdf("Figure_panels/Fig2A_clustered_heatmap.pdf", height=6, width=10)
+heatmap.2(t(up_all_L2FC_hm[,c(2,3,1)]), Colv = as.dendrogram(up_all_hcCor), Rowv = F, col = c(colorRampPalette(colors = brewer.pal(11,"RdBu")[11:10])(100),colorRampPalette(colors = brewer.pal(11,"RdBu")[10:2])(200),colorRampPalette(colors = brewer.pal(11,"RdBu")[2:1])(100)), density.info = "none", cexRow = 0.8, trace = "none", symkey = T, symbreaks = T, ColSideColors = up_all_L2FC$clusterColCor, srtCol = 45)
+#dev.off()
+```
+
+Order of clusters in heatmap is:
+mediumpurple -> cornflowerblue -> darkturquoise -> firebrick -> lightgoldenrod
+
+Reassign cluster numbers so they are numbered from 1 -> 5 left to right
+
+```{r fig.height = 4.3, fig.width=7}
+up_all_L2FC$clustersCor <- factor(up_all_L2FC$clusterColCor, levels = c("mediumpurple", "cornflowerblue", "darkturquoise", "firebrick", "lightgoldenrod"), labels= c(1,2,3,4,5))
+
+```
+
+
+Plot boxplot just for RNA abundance - include this plus simple table above which summarises the other measurements.
+
+```{r fig.height = 3, fig.width=5}
+up_all_L2FC %>%
+  pivot_longer(2:5, names_to = "Dataset", values_to = "Z_score") %>%
+  rename(Cluster = clustersCor) %>%
+  filter(Dataset == "RNA_zscore") %>%
+  ggplot(aes(x = Cluster, y = Z_score)) + 
+    geom_hline(yintercept = 0, colour ="grey60", linetype = "dashed", size = 0.3) + 
+    geom_boxplot(size = 0.3, outlier.size = 0.5, fill = brewer.pal(4, "Set2")[1]) + 
+    labs(y = "Z-score (KO vs Ctrl)") +
+    theme_bw() +
+    theme(panel.background = element_blank(), plot.background = element_blank()) +
+    coord_cartesian(ylim = c(-2,4))
+ggsave("Figure_panels/Fig2B_clusters_RNAboxplot.pdf", useDingbats = F)
+```
+
+Calculate median for each zscore for each of the clusters to help with summary table in 1B
+
+```{r}
+up_all_L2FC %>% 
+  split(up_all_L2FC$clustersCor) %>% 
+  lapply(summary)
+
+```
+
+
+
+CLIP data processing for subsequent figures
+===========================================
+
+Peaks were called using iCount, for the following:
+
+* Individual replicates for each dataset (for 24h iCLIP, grouped high and low MW for the dataset where these were sequenced separately)
+* Grouped replicates for each antibody (BRF1/2 and Tis11b) for the 24h iCLIP data
+* Grouped replicates for both antibodies together for the 24h iCLIP data
+* Grouped replicates for each of the 4h and 72h HITS-CLIP datasets
+
+Individual replicates for the 24h iCLIP were very low in depth, so for this dataset, used only the grouped replicates for subsequent analysis.
+
+Using the files containing all crosslink sites (ie not filtered for FDR < 0.05, but include an FDR column for downstream filtering), annotated the gene/feature type for each crosslink site with iCLIP_Genialis_feature_annotation.R script (https://github.com/LouiseMatheson/Process_CLIP_data). 
+NB - with these files, the annotation done by iCount results in some being duplicated - remove these. 
+
+
+Generate lists of 3'UTR targets for each dataset
+------------------------------------------------
+
+Since depth is relatively low for the 24h iCLIP data, for this I will use the data grouped for each antibody, and designate a gene a target if there is a significant crosslink site (FDR < 0.05) within its 3'UTR for both antibodies (not necessarily the identical site)
+
+```{r}
+read_tsv("CLIP_data/BRF1_2_all_merged_grouped_scores_annotated.tsv.gz") %>%
+  distinct(chromosome, start, strand, .keep_all = T) %>% 
+  filter(FDR < 0.05) %>%
+  filter(Feature  == "UTR3") %>%
+  distinct(Gene_ID) %>%
+  bind_rows({
+    read_tsv("CLIP_data/Tis11b_all_merged_grouped_scores_annotated.tsv.gz") %>%
+      distinct(chromosome, start, strand, .keep_all = T) %>%
+      filter(FDR < 0.05) %>%
+      filter(Feature  == "UTR3") %>%
+      distinct(Gene_ID)
+  }) %>%
+  group_by(Gene_ID) %>%
+  summarise(nAntibodies = n()) %>%
+  filter(nAntibodies == 2) %>%
+  pull(Gene_ID) -> iCLIP_24h_3UTR_targets
+```
+
+For HITS-CLIP data, depth is much better, so for this use the individual replicate datasets, requiring an identical crosslink site to be significant in at least 2 replicates. 
+
+```{r}
+read_tsv("CLIP_data/wt-4h-1_trimmed_single_scores_annotated.tsv.gz") %>%
+  distinct(chromosome, start, strand, .keep_all = T) %>%
+  add_column(Replicate = 1) %>%
+  bind_rows({
+    read_tsv("CLIP_data/wt-4h-2_trimmed_single_scores_annotated.tsv.gz") %>%
+      distinct(chromosome, start, strand, .keep_all = T) %>%
+      add_column(Replicate = 2)
+  }) %>%
+  bind_rows({
+    read_tsv("CLIP_data/wt-4h-3_trimmed_single_scores_annotated.tsv.gz") %>%
+      distinct(chromosome, start, strand, .keep_all = T) %>%
+      add_column(Replicate = 3)
+  }) %>%
+  bind_rows({
+    read_tsv("CLIP_data/wt-4h-4_trimmed_single_scores_annotated.tsv.gz") %>%
+      distinct(chromosome, start, strand, .keep_all = T) %>%
+      add_column(Replicate = 4)
+  }) %>%
+  bind_rows({
+    read_tsv("CLIP_data/wt-4h-5_trimmed_single_scores_annotated.tsv.gz") %>%
+      distinct(chromosome, start, strand, .keep_all = T) %>%
+      add_column(Replicate = 5)
+  }) %>%
+  filter(FDR < 0.05) %>%
+  filter(Feature == "UTR3") %>%
+  group_by(chromosome, start, strand, Gene_ID, Feature) %>%
+  summarise(nReplicates = n(), .groups = "drop") %>%
+  filter(nReplicates >= 2) %>%
+  distinct(Gene_ID) %>%
+  deframe() -> Darnell_4h_3UTR_targets
+```
+```{r}
+read_tsv("CLIP_data/wt-3d-1_trimmed_single_scores_annotated.tsv.gz") %>%
+  distinct(chromosome, start, strand, .keep_all = T) %>%
+  add_column(Replicate = 1) %>%
+  bind_rows({
+    read_tsv("CLIP_data/wt-3d-2_trimmed_single_scores_annotated.tsv.gz") %>%
+      distinct(chromosome, start, strand, .keep_all = T) %>%
+      add_column(Replicate = 2)
+  }) %>%
+  bind_rows({
+    read_tsv("CLIP_data/wt-3d-3_trimmed_single_scores_annotated.tsv.gz") %>%
+      distinct(chromosome, start, strand, .keep_all = T) %>%
+      add_column(Replicate = 3)
+  }) %>%
+  bind_rows({
+    read_tsv("CLIP_data/wt-3d-4_trimmed_single_scores_annotated.tsv.gz") %>%
+      distinct(chromosome, start, strand, .keep_all = T) %>%
+      add_column(Replicate = 4)
+  }) %>%
+  filter(FDR < 0.05) %>%
+  filter(Feature == "UTR3") %>%
+  group_by(chromosome, start, strand, Gene_ID, Feature) %>%
+  summarise(nReplicates = n(), .groups = "drop") %>%
+  filter(nReplicates >= 2) %>%
+  distinct(Gene_ID) %>%
+  deframe() -> Darnell_72h_3UTR_targets
+```
+
+Summary per gene
+----------------
+
+As well as lists of targets, for some later analyses we want to use a summarised value for the 3'UTR of each genes. For this, I will use peaks called from the merged data across all replicates for each of the CLIP datasets, and calculate the sum of crosslinks over the 3'UTR, but only taking into account the crosslink sites with FDR < 0.25.
+
+Since the datasets have quite different coverage, I will normalise to the 90th percentile for each dataset (only taking into account genes with score > 0, ie those that remain after filtering for FDR < 0.25)
+
+```{r}
+read_tsv("CLIP_data/BRF1_2_Tis11b_all_merged_grouped_scores_annotated.tsv.gz") %>%
+  distinct(chromosome, start, strand, .keep_all = T) %>%
+  filter(FDR < 0.25) %>%
+  filter(Feature == "UTR3") %>%
+  group_by(Gene_name) %>%
+  summarise(sum_3UTR_24h = sum(score), Gene_ID = Gene_ID[1]) -> iCLIP_24h_3UTR_sum
+
+iCLIP_24h_3UTR_sum %>% 
+  mutate(sum_3UTR_24h_n90 = sum_3UTR_24h/quantile(iCLIP_24h_3UTR_sum$sum_3UTR_24h, 0.9)) -> iCLIP_24h_3UTR_sum
+
+
+read_tsv("CLIP_data/WT_4h_merged_grouped_scores_annotated.tsv.gz") %>%
+  distinct(chromosome, start, strand, .keep_all = T) %>%
+  filter(FDR < 0.25) %>%
+  filter(Feature == "UTR3") %>%
+  group_by(Gene_name) %>%
+  summarise(sum_3UTR_4h = sum(score), Gene_ID = Gene_ID[1]) -> CLIP_4h_3UTR_sum
+
+CLIP_4h_3UTR_sum %>%
+  mutate(sum_3UTR_4h_n90 = sum_3UTR_4h/quantile(CLIP_4h_3UTR_sum$sum_3UTR_4h, 0.9)) -> CLIP_4h_3UTR_sum
+
+
+read_tsv("CLIP_data/WT_3d_merged_grouped_scores_annotated.tsv.gz") %>%
+  distinct(chromosome, start, strand, .keep_all = T) %>%
+  filter(FDR < 0.25) %>%
+  filter(Feature == "UTR3") %>%
+  group_by(Gene_name) %>%
+  summarise(sum_3UTR_72h = sum(score), Gene_ID = Gene_ID[1]) -> CLIP_72h_3UTR_sum
+
+CLIP_72h_3UTR_sum %>%
+  mutate(sum_3UTR_72h_n90 = sum_3UTR_72h/quantile(CLIP_72h_3UTR_sum$sum_3UTR_72h, 0.9)) -> CLIP_72h_3UTR_sum
+```
+
+
+Table S6 - CLIP targets
+----------------------------------------------
+
+Rather than having all the 4h targets first, then 24h etc, will reorganise to be genomic order
+
+Import GTF file to use to covert gene IDs back to names (and for eg 3'UTR lengths later).
+
+```{r}
+import("Annotations/Mus_musculus.GRCm38.90.gtf.gz") -> GRCm38_90_gtf
+
+Darnell_4h_3UTR_targets %>%
+  as_tibble_col(column_name = "Gene_ID") %>%
+  add_column(CLIP_4h = "Target") %>%
+  full_join({
+    iCLIP_24h_3UTR_targets %>%
+      as_tibble_col(column_name = "Gene_ID") %>%
+      add_column(CLIP_24h = "Target")
+  }) %>%
+  full_join({
+    Darnell_72h_3UTR_targets %>%
+      as_tibble_col(column_name = "Gene_ID") %>%
+      add_column(CLIP_72h = "Target")
+  }) %>%
+  mutate(Gene_name = GRCm38_90_gtf$gene_name[match(Gene_ID, GRCm38_90_gtf$gene_id)]) %>%
+  left_join(CLIP_4h_3UTR_sum) %>%
+  left_join(iCLIP_24h_3UTR_sum) %>%
+  left_join(CLIP_72h_3UTR_sum) %>% 
+  mutate(chromosome = as.factor(seqnames(GRCm38_90_gtf))[match(Gene_ID, GRCm38_90_gtf$gene_id)]) %>%
+  mutate(start = ranges(GRCm38_90_gtf)@start[match(Gene_ID, GRCm38_90_gtf$gene_id)]) %>%
+  arrange(chromosome, start) %>%
+  select(Gene_name, Gene_ID, sum_3UTR_4h, sum_3UTR_24h, sum_3UTR_72h, ends_with("90"), starts_with("CLIP")) %>% 
+  mutate(across(starts_with("sum"), ~ if_else(is.na(.x), 0, .x))) %>% 
+  mutate(across(starts_with("CLIP"), ~ if_else(is.na(.x), "Non-target", .x))) %>%
+  write_tsv("Supplementary_tables/TableS6_CLIP.txt")
+```
+
+
+
+Lengths of 3'UTRs
+-----------------
+
+This is needed for expression/3'UTR length matching to generate control genes sets for each cluster. 
+
+I will sum up the 3'UTR lengths from isoforms with a CCDS, since these are more confident. 
+
+Needs to be in a dataframe, with gene names as row names, and a single column containing the 3'UTR lengths. Object should be named UTR_lengths (this is what the script for expression matching expects)
+
+```{r}
+
+GRCm38_90_gtf[GRCm38_90_gtf$type == "three_prime_utr" & !is.na(GRCm38_90_gtf$ccds_id)] -> gene_3UTRs
+split(gene_3UTRs, gene_3UTRs$gene_id) %>%
+  GenomicRanges::reduce() %>%
+  width() %>%
+  sum() %>%
+  enframe(value = "UTR_length") %>%
+  column_to_rownames("name") -> UTR_lengths
+
+```
+
+FPKMs
+------
+
+I also need to provide FPKM, log2-transformed, to be used for the expression matching. 
+
+These were generated for control samples from 24h iCLIP data, and for RNA-seq corresponding to the two HITS-CLIP datasets (from GSE96050), using cuffnorm and the GRCm38v90 annotation.
+
+Need dataframes containing the log2-transformed FPKM for each replicate, with gene names as row names.
+
+Add 1e-8 to all FPKM before log transforming to deal with 0s (lowest FPKM that are not 0 look to be > 1e-7). 
+
+The expression matching script will exclude any genes from the clusters that are not present in both the 3'UTR and expression dataframes, so it will not pose a problem if some are missing - they will just be ignored: CLIP targets/AREs will not be counted for that gene, and a control gene will not be selected.
+
+```{r}
+read_tsv("FPKM/iCLIP24h_genes.fpkm_table") %>% 
+  column_to_rownames("tracking_id") %>%
+  mutate(across(everything(), ~ log2(.x + 1e-8))) %>%
+  filter(if_all(everything(), is.finite)) -> CD4_24h_FPKM
+
+read_tsv("FPKM/CLIP4h_genes.fpkm_table") %>%
+  column_to_rownames("tracking_id") %>%
+  mutate(across(everything(), ~ log2(.x + 1e-8))) %>%
+  filter(if_all(everything(), is.finite)) -> CD4_4h_FPKM
+
+read_tsv("FPKM/CLIP72h_genes.fpkm_table") %>%
+  column_to_rownames("tracking_id") %>%
+  mutate(across(everything(), ~ log2(.x + 1e-8))) %>% 
+  filter(if_all(everything(), is.finite)) -> CD4_72h_FPKM
+```
+
+Need to export 3 RData files, containing the 3'UTR lengths, log2 FPKM and CLIP targets for the 24h iCLIP, 4h and 72h HITS-CLIP datasets
+
+For each, the script expects the CLIP targets to be called iCLIP_3UTR_hits, and the FPKM to be called Expression_norm_per_kb.
+
+So need to rename each in turn before saving out the RData files. 
+
+```{r}
+Expression_norm_per_kb <- CD4_24h_FPKM
+iCLIP_3UTR_hits <- iCLIP_24h_3UTR_targets
+save(Expression_norm_per_kb, iCLIP_3UTR_hits, UTR_lengths, file = "CLIP_data/iCLIP_24h_exMatch.RData")
+
+Expression_norm_per_kb <- CD4_4h_FPKM
+iCLIP_3UTR_hits <- Darnell_4h_3UTR_targets
+save(Expression_norm_per_kb, iCLIP_3UTR_hits, UTR_lengths, file = "CLIP_data/CLIP_4h_exMatch.RData")
+
+Expression_norm_per_kb <- CD4_72h_FPKM
+iCLIP_3UTR_hits <- Darnell_72h_3UTR_targets
+save(Expression_norm_per_kb, iCLIP_3UTR_hits, UTR_lengths, file = "CLIP_data/CLIP_72h_exMatch.RData")
+```
+
+
+Figure 2C-D - CLIP and ARE enrichment
+=======================================
+
+Export gene lists for each cluster
+-------------------------------------
+
+For these, I will use gene IDs (as I have for FPKM/CLIP targets/3'UTR lengths above) as they are more stable 
+
+```{r}
+up_all_L2FC %>%
+  filter(clustersCor == "1") %>%
+  mutate(Gene_ID = GRCm38_90_gtf$gene_id[match(Gene, GRCm38_90_gtf$gene_name)]) %>%
+  pull(Gene_ID) %>%
+  write("Clusters/cluster1.txt")
+up_all_L2FC %>%
+  filter(clustersCor == "2") %>%
+  mutate(Gene_ID = GRCm38_90_gtf$gene_id[match(Gene, GRCm38_90_gtf$gene_name)]) %>%
+  pull(Gene_ID) %>%
+  write("Clusters/cluster2.txt")
+up_all_L2FC %>%
+  filter(clustersCor == "3") %>%
+  mutate(Gene_ID = GRCm38_90_gtf$gene_id[match(Gene, GRCm38_90_gtf$gene_name)]) %>%
+  pull(Gene_ID) %>%
+  write("Clusters/cluster3.txt")
+up_all_L2FC %>%
+  filter(clustersCor == "4") %>%
+  mutate(Gene_ID = GRCm38_90_gtf$gene_id[match(Gene, GRCm38_90_gtf$gene_name)]) %>%
+  pull(Gene_ID) %>%
+  write("Clusters/cluster4.txt")
+up_all_L2FC %>%
+  filter(clustersCor == "5") %>%
+  mutate(Gene_ID = GRCm38_90_gtf$gene_id[match(Gene, GRCm38_90_gtf$gene_name)]) %>%
+  pull(Gene_ID) %>%
+  write("Clusters/cluster5.txt")
+```
+
+
+Enrichment for CLIP targets within each cluster
+-----------------------------------------------
+
+For each cluster, ran expression matching script (expression_match_iCLIP.R) against each of the three RData files corresponding to each of the CLIP datasets. Eg:
+Rscript --vanilla expression_match_iCLIP.R cluster1.txt iCLIP_24h_exMatch.RData
+
+This creates 100 sets of expression/3'UTR length matched controls for the input gene set (ie, the genes in a given cluster), and identifies the CLIP targets within both the gene set of interest, and the control sets. Also calculates the 5th and 95th percentiles for the number of overlaps in the control sets.
+
+
+```{r}
+list(
+  readRDS("Clusters/cluster1_iCLIP_24h_exMatch_expressionMatch_processed_data.rds") %>%
+  sapply(function(x) add_column(x, cluster = 1)),
+  readRDS("Clusters/cluster2_iCLIP_24h_exMatch_expressionMatch_processed_data.rds") %>%
+  sapply(function(x) add_column(x, cluster = 2)),
+  readRDS("Clusters/cluster3_iCLIP_24h_exMatch_expressionMatch_processed_data.rds") %>%
+  sapply(function(x) add_column(x, cluster = 3)),
+  readRDS("Clusters/cluster4_iCLIP_24h_exMatch_expressionMatch_processed_data.rds") %>%
+  sapply(function(x) add_column(x, cluster = 4)),
+  readRDS("Clusters/cluster5_iCLIP_24h_exMatch_expressionMatch_processed_data.rds") %>%
+  sapply(function(x) add_column(x, cluster = 5))
+) -> all_clusters_24h_CLIP
+
+
+list(
+  readRDS("Clusters/cluster1_CLIP_4h_exMatch_expressionMatch_processed_data.rds") %>%
+  sapply(function(x) add_column(x, cluster = 1)),
+  readRDS("Clusters/cluster2_CLIP_4h_exMatch_expressionMatch_processed_data.rds") %>%
+  sapply(function(x) add_column(x, cluster = 2)),
+  readRDS("Clusters/cluster3_CLIP_4h_exMatch_expressionMatch_processed_data.rds") %>%
+  sapply(function(x) add_column(x, cluster = 3)),
+  readRDS("Clusters/cluster4_CLIP_4h_exMatch_expressionMatch_processed_data.rds") %>%
+  sapply(function(x) add_column(x, cluster = 4)),
+  readRDS("Clusters/cluster5_CLIP_4h_exMatch_expressionMatch_processed_data.rds") %>%
+  sapply(function(x) add_column(x, cluster = 5))
+) -> all_clusters_4h_CLIP
+
+list(
+  readRDS("Clusters/cluster1_CLIP_72h_exMatch_expressionMatch_processed_data.rds") %>%
+  sapply(function(x) add_column(x, cluster = 1)),
+  readRDS("Clusters/cluster2_CLIP_72h_exMatch_expressionMatch_processed_data.rds") %>%
+  sapply(function(x) add_column(x, cluster = 2)),
+  readRDS("Clusters/cluster3_CLIP_72h_exMatch_expressionMatch_processed_data.rds") %>%
+  sapply(function(x) add_column(x, cluster = 3)),
+  readRDS("Clusters/cluster4_CLIP_72h_exMatch_expressionMatch_processed_data.rds") %>%
+  sapply(function(x) add_column(x, cluster = 4)),
+  readRDS("Clusters/cluster5_CLIP_72h_exMatch_expressionMatch_processed_data.rds") %>%
+  sapply(function(x) add_column(x, cluster = 5))
+) -> all_clusters_72h_CLIP
+
+```
+
+Collate results for each dataset into a single tibble, and calculate values normalised to the median in the expression matched controls
+
+```{r}
+tibble(Cluster=sapply(all_clusters_24h_CLIP, function(x) x[[1]][1,"cluster"]),
+       Total_overlaps=sapply(all_clusters_24h_CLIP, function(x) sum(x[[1]]$iCLIP_hit)), 
+       ExMatch_median=sapply(all_clusters_24h_CLIP, function(x) median(x[[2]]$Overlap)), 
+       ExMatch_q95=sapply(all_clusters_24h_CLIP, function(x) x[[2]][1,2]), 
+       ExMatch_q5=sapply(all_clusters_24h_CLIP, function(x) x[[2]][1,3])) %>%
+  mutate(Overlap_enrichment = Total_overlaps/ExMatch_median) %>%
+  mutate(q5_enrichment = ExMatch_q5/ExMatch_median) %>%
+  mutate(q95_enrichment = ExMatch_q95/ExMatch_median) %>%
+  mutate(Cluster = as.factor(Cluster)) -> summary_clusters_24hCLIP
+
+tibble(Cluster=sapply(all_clusters_4h_CLIP, function(x) x[[1]][1,"cluster"]),
+       Total_overlaps=sapply(all_clusters_4h_CLIP, function(x) sum(x[[1]]$iCLIP_hit)), 
+       ExMatch_median=sapply(all_clusters_4h_CLIP, function(x) median(x[[2]]$Overlap)), 
+       ExMatch_q95=sapply(all_clusters_4h_CLIP, function(x) x[[2]][1,2]), 
+       ExMatch_q5=sapply(all_clusters_4h_CLIP, function(x) x[[2]][1,3])) %>%
+  mutate(Overlap_enrichment = Total_overlaps/ExMatch_median) %>%
+  mutate(q5_enrichment = ExMatch_q5/ExMatch_median) %>%
+  mutate(q95_enrichment = ExMatch_q95/ExMatch_median) %>%
+  mutate(Cluster = as.factor(Cluster)) -> summary_clusters_4hCLIP
+
+tibble(Cluster=sapply(all_clusters_72h_CLIP, function(x) x[[1]][1,"cluster"]),
+       Total_overlaps=sapply(all_clusters_72h_CLIP, function(x) sum(x[[1]]$iCLIP_hit)), 
+       ExMatch_median=sapply(all_clusters_72h_CLIP, function(x) median(x[[2]]$Overlap)), 
+       ExMatch_q95=sapply(all_clusters_72h_CLIP, function(x) x[[2]][1,2]), 
+       ExMatch_q5=sapply(all_clusters_72h_CLIP, function(x) x[[2]][1,3])) %>%
+  mutate(Overlap_enrichment = Total_overlaps/ExMatch_median) %>%
+  mutate(q5_enrichment = ExMatch_q5/ExMatch_median) %>%
+  mutate(q95_enrichment = ExMatch_q95/ExMatch_median) %>%
+  mutate(Cluster = as.factor(Cluster)) -> summary_clusters_72hCLIP
+
+```
+
+
+ARE analysis
+------------
+
+Next ran through TATT_analysis.R script, which identifies TATT/TATTTATT motifs within the 3'UTRs of each gene, using the GRCm38 v90 GTF file to identify 3'UTR coordinates. 
+Eg:
+Rscript --vanilla TATT_analysis.R cluster1_CLIP_72h_exMatch_expression_matched.txt Mus_musculus.GRCm38.90.gtf
+
+
+Collate data into a single tibble:
+
+For this, the CLIP dataset used should not matter as the 3'UTR sequences are still the same, but it's helpful to have run with one of the outputs from the expression/3'UTR length matching since this will still give good sets of control genes. I will plot just for the controls identified for the 72h CLIP dataset. 
+
+
+```{r}
+read_tsv("Clusters/TATT_cluster1_CLIP_72h_exMatch_expression_matched.txt") %>%
+  filter(Type != "Random") %>%
+  group_by(Type, Gene_set) %>%
+  summarise(TATTTATT = sum(nTATTTATT > 0)) %>%
+  summarise(median = median(TATTTATT), q5 = quantile(TATTTATT, 0.05), q95 = quantile(TATTTATT, 0.95)) %>%
+  add_column(Cluster = "1") -> TATTTATT_cluster1
+
+read_tsv("Clusters/TATT_cluster2_CLIP_72h_exMatch_expression_matched.txt") %>%
+  filter(Type != "Random") %>%
+  group_by(Type, Gene_set) %>%
+  summarise(TATTTATT = sum(nTATTTATT > 0)) %>%
+  summarise(median = median(TATTTATT), q5 = quantile(TATTTATT, 0.05), q95 = quantile(TATTTATT, 0.95)) %>%
+  add_column(Cluster = "2") -> TATTTATT_cluster2
+
+read_tsv("Clusters/TATT_cluster3_CLIP_72h_exMatch_expression_matched.txt") %>%
+  filter(Type != "Random") %>%
+  group_by(Type, Gene_set) %>%
+  summarise(TATTTATT = sum(nTATTTATT > 0)) %>%
+  summarise(median = median(TATTTATT), q5 = quantile(TATTTATT, 0.05), q95 = quantile(TATTTATT, 0.95)) %>%
+  add_column(Cluster = "3") -> TATTTATT_cluster3
+
+read_tsv("Clusters/TATT_cluster4_CLIP_72h_exMatch_expression_matched.txt") %>%
+  filter(Type != "Random") %>%
+  group_by(Type, Gene_set) %>%
+  summarise(TATTTATT = sum(nTATTTATT > 0)) %>%
+  summarise(median = median(TATTTATT), q5 = quantile(TATTTATT, 0.05), q95 = quantile(TATTTATT, 0.95)) %>%
+  add_column(Cluster = "4") -> TATTTATT_cluster4
+
+read_tsv("Clusters/TATT_cluster5_CLIP_72h_exMatch_expression_matched.txt") %>%
+  filter(Type != "Random") %>%
+  group_by(Type, Gene_set) %>%
+  summarise(TATTTATT = sum(nTATTTATT > 0)) %>%
+  summarise(median = median(TATTTATT), q5 = quantile(TATTTATT, 0.05), q95 = quantile(TATTTATT, 0.95)) %>%
+  add_column(Cluster = "5") -> TATTTATT_cluster5
+
+```
+```{r fig.height=5, fig.width=5}
+bind_rows(TATTTATT_cluster1, TATTTATT_cluster2, TATTTATT_cluster3, TATTTATT_cluster4, TATTTATT_cluster5) %>%
+  mutate(Type = sub(" ", "_", sub("[0-9]", "", Type))) %>%
+  pivot_wider(id_cols = Cluster, names_from = Type, values_from = c(median, q5, q95)) %>%
+  mutate(across(-Cluster, ~ .x/median_Expression_matched)) -> TATTTATT_summary_norm
+
+```
+
+Generate plots for CLIP and AREs
+---------------------------------
+
+```{r fig.height=3, fig.width=8.2}
+ARE_total_overlaps <- sapply(ls(pattern = "TATT_cluster"), function(x) get(x)$median[1])
+
+summary_clusters_24hCLIP %>%
+  add_column(Dataset = "iCLIP_24h") %>%
+  bind_rows(add_column(summary_clusters_4hCLIP, Dataset = "HITSCLIP_4h")) %>%
+  bind_rows(add_column(summary_clusters_72hCLIP, Dataset = "HITSCLIP_72h")) %>%
+  add_column(Type = "CLIP") %>%
+  bind_rows({
+    TATTTATT_summary_norm %>%
+      add_column(Dataset = "AREs") %>%
+      add_column(Type = "ARE") %>%
+      rename(Overlap_enrichment = median_cluster) %>%
+      rename(q5_enrichment = q5_Expression_matched) %>%
+      rename(q95_enrichment = q95_Expression_matched) %>%
+      add_column(Total_overlaps = ARE_total_overlaps)
+      }) %>%
+  mutate(Dataset = factor(Dataset, levels = c("HITSCLIP_4h", "iCLIP_24h", "HITSCLIP_72h", "AREs"))) %>%
+  mutate(Type2 = paste0(Type, "2")) %>%
+  ggplot(aes(x = Cluster, y = Overlap_enrichment)) +
+    geom_col(aes(fill = Type)) + 
+    geom_col(aes(y = 1, fill = Type2), width=0.7) +
+    geom_errorbar(aes(ymin = q5_enrichment, ymax = q95_enrichment), width=0.5) +
+    geom_text(aes(label = Total_overlaps), vjust = 0, nudge_y = 0.1, size = 3.5) +
+    facet_grid(~Dataset) +
+    theme_bw() +
+    theme(panel.grid.major.x = element_blank(), legend.position = "none", plot.background = element_blank(), panel.background = element_blank()) +
+    scale_fill_manual(breaks = c("CLIP", "CLIP2", "ARE", "ARE2"), values = c("mediumturquoise", "darkcyan", brewer.pal(6,"Purples")[4], brewer.pal(6,"Purples")[6])) +
+    coord_cartesian(ylim = c(0,2.8)) +
+    scale_y_continuous(expand = c(0,0))
+ggsave("Figure_panels/Fig2CD_CLIPAREenrich.pdf")
+
+
+```
+
+Figure 2E-F: gene set analyses
+==============================
+
+Gene set and background control lists
+--------------------------------------
+
+For GO term analysis, we want to consider all genes together (ie everything used for the clustering). For TRANSFAC, only those with increased transcription (clusters 3-5). We will use gene IDs since these are more stable.
+
+For the background list, select genes with base mean > 25 in standard mRNA-seq, and convert gene names to IDs based on GTF.
+
+```{r}
+
+up_all_L2FC %>%
+  mutate(Gene_ID = GRCm38_90_gtf$gene_id[match(Gene, GRCm38_90_gtf$gene_name)]) %>%
+  pull(Gene_ID) %>%
+  write("GO_term_analysis/all_clusters.txt")
+
+up_all_L2FC %>%
+  filter(clustersCor %in% c("3", "4", "5")) %>%
+  mutate(Gene_ID = GRCm38_90_gtf$gene_id[match(Gene, GRCm38_90_gtf$gene_name)]) %>%
+  pull(Gene_ID) %>%
+  write("GO_term_analysis/cluster345.txt")
+res_RNA %>%
+  filter(baseMean > 25) %>%
+  mutate(Gene_ID = GRCm38_90_gtf$gene_id[match(Gene, GRCm38_90_gtf$gene_name)]) %>%
+  pull(Gene_ID) %>%
+  write("GO_term_analysis/Background_expressed.txt")
+
+```
+
+GO biological process
+-----------------------
+
+GO term analysis against Biological Process terms was performed using GOrilla, with the background list above, for the genes comprising all five clusters. Results exported and saved into a text file. 
+
+
+### Filtering and REVIGO analysis
+
+Results include a lot of redundancy - I will filter these to include only terms with enrichment > 2, and then run through REVIGO to reduce redundancy (using enrichment as the metric to decide representative terms, since this gives the more specific terms).
+
+```{r}
+read_tsv("GO_term_analysis/GOrilla_all_clusters.txt") %>%
+  rename_with(~ gsub("[ -]", "_", .x)) %>%
+  filter(FDR_q_value < 0.05 & Enrichment > 2) -> GOrilla_cluster1
+GOrilla_cluster1 %>% 
+  select(GO_Term, Enrichment) %>%
+  write_tsv("GO_term_analysis/all_clusters_sig_enrich2.txt")
+
+```
+Reduced these using REVIGO (http://revigo.irb.hr/), based on semantic similarity, allowing small similarity and prioritising terms with higher enrichment as representative terms.
+
+For the reduced list, will plot the top 20 based on adjusted p value (add these back in from the original GO term analysis).
+
+Complete results (filtered for enrichment > 2 and FDR < 0.05, but including terms removed by REVIGO) will be included as supplementary tables.
+
+```{r}
+read_tsv("GO_term_analysis/Revigo_all_clusters.tsv") %>%
+  left_join(GOrilla_cluster1, by = c("TermID" = "GO_Term")) -> Revigo_all_clusters
+
+```
+
+### Table S7 - gene set enrichment
+
+First write out table for supplementary (before re-ordering/filtering)
+
+This will be combined with TRANSFAC output into a single table in Excel
+
+```{r}
+Revigo_all_clusters %>%
+  select(1,15,6,7,13,14,16:23) %>% 
+    write_tsv("Supplementary_tables/TableS7_GOallclusters.txt")
+
+```
+
+
+### Plot data
+
+Now filter, arrange by FDR, and plot the top 10 terms - but only actually including plot for cluster 4 in manuscript
+
+```{r fig.height = 5, fig.width = 5}
+Revigo_all_clusters %>%
+  filter(Eliminated == FALSE) %>%
+  arrange(FDR_q_value) %>%
+  mutate(Description = factor(Description, levels = rev(Description))) %>%
+  slice(1:20) %>%
+  ggplot(aes(x = Description, y = -log10(FDR_q_value))) +
+    geom_col(fill = "mediumpurple", width = 0.8) +
+    coord_flip() +
+    labs(x = NULL, y = "-Log10 p value\n(FDR-adjusted)", title = "GO BP all clusters")
+ggsave("Figure_panels/Fig2E_GOBP.pdf")
+
+```
+
+
+TRANSFAC - enrichment for TF binding sites
+-------------------------------------------
+
+Ran genes comprising clusters 3-5 (all show increased transcription) together through gProfiler, with the same background list as above, with just the TRANSFAC data source.
+
+Exported results from gProfiler - this will be directly added into table S7
+
+### Plot data
+
+```{r fig.width=3.5, fig.height=2}
+read_tsv("GO_term_analysis/cluster3_4_5_gProfiler_TRANSFAC.txt") %>%
+  mutate(term_name = sub("Factor: (.*motif.*?);.*", "\\1", term_name)) %>%
+  mutate(term_name = factor(term_name, levels= rev(term_name))) %>%
+  ggplot(aes(x = term_name, y = negative_log10_of_adjusted_p_value)) + 
+    geom_col(fill = "mediumseagreen", width = 0.8) +
+    coord_flip() +
+    labs(y = "-Log10 p value\n(FDR-adjusted)", x = NULL, title= "Clusters 3-5")
+ggsave("Figure_panels/Fig2F_TRANSFAC_cluster345.pdf")
+```
+
+
+Table S5 - clusters
+==============================
+
+Want to include TATTTATT motifs in 3'UTR, and CLIP targets.
+
+For TATTTATT, I only created a summary, so first need to read the output from the TATT analysis for each of the clusters. Genes that aren't present in these outputs are those without a 3'UTR - so can set NAs to 0 once I've merged the tables, since by definition they can't have any TATTTATTs in a 3'UTR if they don't have one! 
+
+```{r}
+read_tsv("Clusters/TATT_cluster1_CLIP_72h_exMatch_expression_matched.txt") %>%
+  filter(Gene_set == "cluster1") %>%
+  select(Gene, nTATTTATT, transcript_id) %>% 
+  bind_rows({
+    read_tsv("Clusters/TATT_cluster2_CLIP_72h_exMatch_expression_matched.txt") %>%
+      filter(Gene_set == "cluster2") %>%
+      select(Gene, nTATTTATT, transcript_id)
+  }) %>% 
+  bind_rows({
+    read_tsv("Clusters/TATT_cluster3_CLIP_72h_exMatch_expression_matched.txt") %>%
+      filter(Gene_set == "cluster3") %>%
+      select(Gene, nTATTTATT, transcript_id)
+  }) %>% 
+  bind_rows({
+    read_tsv("Clusters/TATT_cluster4_CLIP_72h_exMatch_expression_matched.txt") %>%
+      filter(Gene_set == "cluster4") %>%
+      select(Gene, nTATTTATT, transcript_id)
+  }) %>% 
+  bind_rows({
+    read_tsv("Clusters/TATT_cluster5_CLIP_72h_exMatch_expression_matched.txt") %>%
+      filter(Gene_set == "cluster5") %>%
+      select(Gene, nTATTTATT, transcript_id)
+  }) %>%
+  rename(Gene_ID = Gene) -> nTATTTATT_all_clusters
+
+up_all_L2FC %>% 
+  mutate(Gene_ID = GRCm38_90_gtf$gene_id[match(Gene, GRCm38_90_gtf$gene_name)]) %>%
+  select(Gene, Gene_ID, Nascent_zscore, Stability_zscore, RNA_zscore, Ribo_zscore, clustersCor) %>%
+  mutate(CLIP_4h = Gene_ID %in% Darnell_4h_3UTR_targets) %>%
+  mutate(iCLIP_24h = Gene_ID %in% iCLIP_24h_3UTR_targets) %>%
+  mutate(CLIP_72h = Gene_ID %in% Darnell_72h_3UTR_targets) %>%
+  left_join(nTATTTATT_all_clusters) %>%
+  mutate(row_id = row_number()) %>%
+  arrange(match(row_id, up_all_hcCor$order)) %>%
+  select(-row_id) %>%
+  write_tsv("Supplementary_tables/TableS5_clusters.txt")
+```
+
+
+
+CLIP binding profiles
+=====================
+
+Need to write a function to plot the CLIP binding profile for a given gene, in a given CLIP dataset. I will write this to take transcript names - so would first need to use eg Ensembl to decide which isoform we want to plot. My preference is to plot all crosslink sites irrespective of the FDR, so signal to noise ratio is clear - so also need to read these in and save.
+
+
+```{r}
+read_tsv("CLIP_data/BRF1_2_Tis11b_all_merged_grouped_scores_annotated.tsv.gz") %>%
+  distinct(chromosome, start, strand, .keep_all = T) -> iCLIP_24h_all_xl_sites
+read_tsv("CLIP_data/WT_4h_merged_grouped_scores_annotated.tsv.gz") %>%
+  distinct(chromosome, start, strand, .keep_all = T) -> CLIP_4h_all_xl_sites
+read_tsv("CLIP_data/WT_3d_merged_grouped_scores_annotated.tsv.gz") %>%
+  distinct(chromosome, start, strand, .keep_all = T) -> CLIP_72h_all_xl_sites
+```
+
+For conservation tracks, we will use phyloP scores from a 60-way multiple alignment, averaged over a 7 base sliding window.
+
+60-way phyloP scores for each chromosome were downloaded from UCSC and converted to BED format with bash script (download_mm10_phyloP60_chr_wig2bed.sh).
+
+Then filtered to include only regions surrounding genes of interest using pull_out_phyloP.R script.
+
+Read in filtered phyloP scores:
+
+```{r}
+read_tsv("seq_conservation/PhyloP_selected_regions_CD4manuscript.txt") %>%
+  rename(chromosome = seqnames) -> phyloP_selected
+```
+
+smooth by calculating average in 7 base windows
+
+```{r}
+phyloP_selected %>%
+  group_by(chromosome) %>%
+  mutate(score_smooth = slider::slide_mean(score, before = 3, after =3)) -> phyloP_selected
+```
+
+
+For function, optionally can provide zoom_min and/or zoom_max if you want to display only a portion of the gene (eg only the 3' end).
+Can also set displayTATT to TRUE if you want to show locations of TATT motifs
+
+
+```{r}
+plot_CLIP_profile = function(Transcript, CLIPdata = CLIP_72h_all_xl_sites, zoom_min = NA, zoom_max = NA, displayTATT = F, consPlot = F, consData = phyloP_selected, max_cons = max(abs(consData$score_smooth))) {
+  GRCm38_90_gtf[GRCm38_90_gtf$transcript_name %in% Transcript & GRCm38_90_gtf$type %in% c("CDS", "stop_codon", "five_prime_utr", "three_prime_utr")] %>%
+    as_tibble() %>%
+    select(seqnames, start, end, strand, type) %>%
+    mutate(type = if_else(type %in% c("CDS", "stop_codon"), "CDS", "UTR")) %>%
+    mutate(exon_start = if_else(strand == "+", start - 0.5, end + 0.5)) %>%
+    mutate(exon_end = if_else(strand == "+", end + 0.5, start - 0.5)) -> transcript_coord
+  if(transcript_coord$strand[1] == "+") {
+    transcript_coord %>%
+      arrange(exon_start) -> transcript_coord
+  } else {
+    transcript_coord %>%
+      arrange(desc(exon_start)) -> transcript_coord
+  }
+  transcript_coord %>%
+    mutate(intron_start = exon_end, intron_end = lead(exon_start)) %>%
+    mutate(intron_start = if_else(intron_start == intron_end, NA_real_, intron_start)) %>%
+    mutate(intron_end = if_else(is.na(intron_start), NA_real_, intron_end)) -> transcript_coord
+  
+  if(is.na(zoom_min)) {
+    zoom_min <- min(transcript_coord$start)
+  }
+  if(is.na(zoom_max)) {
+    zoom_max <- max(transcript_coord$end)
+  }
+  
+  CLIPdata %>%
+    filter(chromosome == paste0("chr", transcript_coord$seqnames[1])) %>% # NB this won't work for MT but I don't need it to for my purposes. 
+    filter(start >= zoom_min & start <= zoom_max) %>%
+    mutate(score_norm = score/max(score)) -> CLIPdata
+  
+  ggplot() +
+    geom_rect(data = CLIPdata, aes(xmin = start-0.5, xmax = start+0.5, ymin = 0, ymax = score_norm), fill = "royalblue4", colour = "royalblue4") + 
+    geom_rect(data = transcript_coord, aes(xmin = exon_start, xmax = exon_end, fill = type, ymin = -0.4, ymax = -0.1), colour = "royalblue4") + 
+    scale_fill_manual(name = NULL, values = c("royalblue4","transparent")) + 
+    geom_segment(data = transcript_coord, aes(x = intron_start, xend = intron_end, y = -0.15, yend = -0.25), colour  = "royalblue4") + 
+    geom_segment(data = transcript_coord, aes(x = intron_start, xend = intron_end, y = -0.35, yend = -0.25), colour  = "royalblue4") + 
+    annotate("text",x = zoom_min, y = 1, label = max(CLIPdata$score), vjust = 0.5, hjust = 0)+
+    geom_hline(yintercept = 0) +
+    theme(axis.line = element_blank()) +
+    coord_cartesian(xlim = c(zoom_min-1, zoom_max+1)) +
+    scale_x_continuous(expand = c(0,0)) +
+    labs(x = paste("Chromosome", transcript_coord$seqnames[1]), y = "CLIP crosslinks", title = Transcript) -> CLIPplot
+  
+  if(displayTATT == T) {
+    getSeq(BSgenome.Mmusculus.UCSC.mm10, paste0("chr", transcript_coord$seqnames[1]), zoom_min, zoom_max, strand = transcript_coord$strand[1], as.character = T) -> transcript_seq
+    TATT_indices <- gregexpr("(?=TATT)", transcript_seq, perl=T)[[1]]
+    if(transcript_coord$strand[1] == "+") {
+      TATT_indices <- TATT_indices + zoom_min - 1
+    } else {
+      TATT_indices <- zoom_max - (TATT_indices+2)
+    }
+    CLIPplot + 
+    geom_rect(aes(xmin = TATT_indices-0.5, xmax = TATT_indices+3.5, ymin = -0.4, ymax = -0.1), colour = "orange", fill = "orange") -> CLIPplot
+  } 
+  
+  if(consPlot == T){
+    consData %>%
+      filter(chromosome == paste0("chr", transcript_coord$seqnames[1])) %>% # NB this won't work for MT but I don't need it to for my purposes. 
+      filter(start >= zoom_min & start <= zoom_max) %>%
+      mutate(score_smooth = (score_smooth/(2*max_cons))-1) -> consData
+    CLIPplot +
+      geom_hline(yintercept = -1) +
+      geom_line(data = consData, aes(x = start, y = score_smooth)) -> CLIPplot
+  }
+  
+  return(CLIPplot)
+}
+```
+
+Will generate plots now for all the genes I want to show.
+
+May not want both complete gene and zoomed in on 3'UTR for all of them, but will create them in case.
+
+Figure S2
+----------
+
+### Hk2
+
+```{r fig.height=2, fig.width=5}
+plot_CLIP_profile("Hk2-201")
+ggsave("Figure_panels/FigS2A_Hk2CLIP_complete.pdf")
+plot_CLIP_profile("Hk2-201", zoom_max = 82728150, displayTATT = T, consPlot = T)
+ggsave("Figure_panels/FigS2A_Hk2CLIP_3UTR.pdf")
+```
+
+### Pfkfb3
+
+```{r fig.height=2, fig.width=5}
+plot_CLIP_profile("Pfkfb3-201")
+ggsave("Figure_panels/FigS2A_Pfkfb3CLIP_complete.pdf")
+plot_CLIP_profile("Pfkfb3-201", zoom_max = 11475000, displayTATT = T, consPlot = T)
+ggsave("Figure_panels/FigS2A_Pfkfb3CLIP_3UTR.pdf")
+```
+### Myc
+
+```{r fig.height=2, fig.width=5}
+plot_CLIP_profile("Myc-201")
+ggsave("Figure_panels/FigS2A_MycCLIP_complete.pdf")
+plot_CLIP_profile("Myc-201", zoom_min = 61989500, displayTATT = T, consPlot = T)
+ggsave("Figure_panels/FigS2A_MycCLIP_3UTR.pdf")
+```
+
+### Hif1a
+
+```{r fig.height=2, fig.width=5}
+plot_CLIP_profile("Hif1a-201")
+ggsave("Figure_panels/FigS2A_Hif1aCLIP_complete.pdf")
+plot_CLIP_profile("Hif1a-201", zoom_min = 73945000, displayTATT = T, consPlot = T)
+ggsave("Figure_panels/FigS2A_Hif1aCLIP_3UTR.pdf")
+```
+
+### Slc2a1
+
+```{r fig.height=2, fig.width=5}
+plot_CLIP_profile("Slc2a1-201")
+ggsave("Figure_panels/FigS2B_Slc2a1CLIP_complete.pdf")
+plot_CLIP_profile("Slc2a1-201", zoom_min = 119134900, displayTATT = T, consPlot = T)
+ggsave("Figure_panels/FigS2B_Slc2a1CLIP_3UTR.pdf")
+```
+
+### Slc2a3
+
+```{r fig.height=2, fig.width=5}
+plot_CLIP_profile("Slc2a3-201")
+ggsave("Figure_panels/FigS2C_Slc2a3CLIP_complete.pdf")
+plot_CLIP_profile("Slc2a3-201", zoom_max = 122730100, displayTATT = T, consPlot = T)
+ggsave("Figure_panels/FigS2C_Slc2a3CLIP_3UTR.pdf")
+```
+
+### Pfkp
+
+```{r fig.height=2, fig.width=5}
+plot_CLIP_profile("Pfkp-201")
+ggsave("Figure_panels/FigS2F_PfkpCLIP_complete.pdf")
+plot_CLIP_profile("Pfkp-201", zoom_max = 6582050, displayTATT = T, consPlot = T)
+ggsave("Figure_panels/FigS2F_PfkpCLIP_3UTR.pdf")
+```
+
+
+Figure S3A-B
+------------
+
+### Mthfd2
+
+```{r fig.height=2, fig.width=5}
+plot_CLIP_profile("Mthfd2-201")
+ggsave("Figure_panels/FigS3A_Mthfd2CLIP_complete.pdf")
+plot_CLIP_profile("Mthfd2-201", zoom_max = 83307100, displayTATT = T, consPlot = T)
+ggsave("Figure_panels/FigS3A_Mthfd2CLIP_3UTR.pdf")
+```
+
+
+### Mat2a
+
+```{r fig.height=2, fig.width=5}
+plot_CLIP_profile("Mat2a-201")
+ggsave("Figure_panels/FigS3B_Mat2aCLIP_complete.pdf")
+plot_CLIP_profile("Mat2a-201", zoom_max = 72434580, displayTATT = T, consPlot = T)
+ggsave("Figure_panels/FigS3B_Mat2aCLIP_3UTR.pdf")
+```
+
+Figure S3E
+------------
+
+### Idh3a
+
+```{r fig.height=2, fig.width=5}
+plot_CLIP_profile("Idh3a-201")
+ggsave("Figure_panels/FigS3E_Idh3aCLIP_complete.pdf")
+plot_CLIP_profile("Idh3a-201", zoom_min = 54603000, displayTATT = T, consPlot = T)
+ggsave("Figure_panels/FigS3E_Idh3aCLIP_3UTR.pdf")
+```
+
+### Ogdh
+
+```{r fig.height=2, fig.width=5}
+plot_CLIP_profile("Ogdh-201")
+ggsave("Figure_panels/FigS3E_OgdhCLIP_complete.pdf")
+plot_CLIP_profile("Ogdh-201", zoom_min = 6355000, displayTATT = T, consPlot = T)
+ggsave("Figure_panels/FigS3E_OgdhCLIP_3UTR.pdf")
+```
+
+### Mdh2
+
+```{r fig.height=2, fig.width=5}
+plot_CLIP_profile("Mdh2-201")
+ggsave("Figure_panels/FigS3E_Mdh2CLIP_complete.pdf")
+plot_CLIP_profile("Mdh2-201", zoom_min = 135790000, displayTATT = T, consPlot = T)
+ggsave("Figure_panels/FigS3E_Mdh2CLIP_3UTR.pdf")
+```
+
+### Got1
+
+```{r fig.height=2, fig.width=5}
+plot_CLIP_profile("Got1-201")
+ggsave("Figure_panels/FigS3E_Got1CLIP_complete.pdf")
+plot_CLIP_profile("Got1-201", zoom_max = 43501000, displayTATT = T, consPlot = T)
+ggsave("Figure_panels/FigS3E_Got1CLIP_3UTR.pdf")
+```
+
+### Acly
+
+```{r fig.height=2, fig.width=5}
+plot_CLIP_profile("Acly-201")
+ggsave("Figure_panels/FigS3E_AclyCLIP_complete.pdf")
+plot_CLIP_profile("Acly-201", zoom_max = 100477500, displayTATT = T, consPlot = T)
+ggsave("Figure_panels/FigS3E_AclyCLIP_3UTR.pdf")
+```
+
+### Pank3
+
+```{r fig.height=2, fig.width=5}
+plot_CLIP_profile("Pank3-201")
+ggsave("Figure_panels/FigS3E_Pank3CLIP_complete.pdf")
+plot_CLIP_profile("Pank3-201", zoom_min = 35785000, displayTATT = T, consPlot = T)
+ggsave("Figure_panels/FigS3E_Pank3CLIP_3UTR.pdf")
+```
+
+### Fasn
+
+```{r fig.height=2, fig.width=5}
+plot_CLIP_profile("Fasn-201")
+ggsave("Figure_panels/FigS3E_FasnCLIP_complete.pdf")
+plot_CLIP_profile("Fasn-201", zoom_max = 120808000, displayTATT = T, consPlot = T)
+ggsave("Figure_panels/FigS3E_FasnCLIP_3UTR.pdf")
+```
+
+### Hmgcr
+
+```{r fig.height=2, fig.width=5}
+plot_CLIP_profile("Hmgcr-201")
+ggsave("Figure_panels/FigS3E_HmgcrCLIP_complete.pdf")
+plot_CLIP_profile("Hmgcr-201", zoom_max = 96651000, displayTATT = T, consPlot = T)
+ggsave("Figure_panels/FigS3E_HmgcrCLIP_3UTR.pdf")
+```
+
+Figure 5A-C
+-----------
+
+### Gls
+
+```{r fig.height=2, fig.width=5}
+plot_CLIP_profile("Gls-202")
+ggsave("Figure_panels/Fig5A_GlsCLIP_complete.pdf")
+plot_CLIP_profile("Gls-202", zoom_max = 52188200, displayTATT = T, consPlot = T)
+ggsave("Figure_panels/Fig5A_GlsCLIP_3UTR.pdf")
+```
+
+### Glud1
+
+```{r fig.height=2, fig.width=5}
+plot_CLIP_profile("Glud1-201")
+ggsave("Figure_panels/Fig5B_Glud1CLIP_complete.pdf")
+plot_CLIP_profile("Glud1-201", zoom_min = 34343000, zoom_max = 34345265, displayTATT = T, consPlot = T)
+ggsave("Figure_panels/Fig5B_Glud1CLIP_3UTR.pdf")
+```
+
+### Slc38a2
+
+```{r fig.height=2, fig.width=5}
+plot_CLIP_profile("Slc38a2-201")
+ggsave("Figure_panels/Fig5C_Slc38a2CLIP_complete.pdf")
+plot_CLIP_profile("Slc38a2-201", zoom_max = 96691000, displayTATT = T, consPlot = T)
+ggsave("Figure_panels/Fig5C_Slc38a2CLIP_3UTR.pdf")
+```
+
+Figure S4E
+------------
+
+### Gzmb
+
+```{r fig.height=2, fig.width=4}
+plot_CLIP_profile("Gzmb-201")
+ggsave("Figure_panels/FigS4E_GzmbCLIP_complete.pdf")
+plot_CLIP_profile("Gzmb-201", zoom_max = 56259500, displayTATT = T, consPlot = T)
+ggsave("Figure_panels/FigS4E_GzmbCLIP_3UTR.pdf")
+```
+
+### Tbx21
+
+```{r fig.height=2, fig.width=4}
+plot_CLIP_profile("Tbx21-201")
+ggsave("Figure_panels/FigS4E_Tbx21CLIP_complete.pdf")
+plot_CLIP_profile("Tbx21-201", zoom_max = 97099000, displayTATT = T, consPlot = T)
+ggsave("Figure_panels/FigS4E_Tbx21CLIP_3UTR.pdf")
+```
+
+### Hopx
+
+```{r fig.height=2, fig.width=4}
+plot_CLIP_profile("Hopx-201")
+ggsave("Figure_panels/FigS4E_HopxCLIP_complete.pdf")
+plot_CLIP_profile("Hopx-201", zoom_max = 77088000, displayTATT = T, consPlot = T)
+ggsave("Figure_panels/FigS4E_HopxCLIP_3UTR.pdf")
+```
+
+
+Sequence conservation (Fig S2, S3, 5)
+-------------------------------------
+
+For sequence conservation plots, orthologues were identified and 3'UTR sequences extracted using biomart, where possible, or manually if orthologues/equivalent 3'UTRs were not annotated. Alignment of the whole 3'UTR was then done with kalign, before extracting the portion corresponding to the ARE(s), and TATT motifs highlighted manually in Illustrator.
+
+
+Figure 3A, 4A, 6A - metabolism heatmaps
+========================================
+
+Heatmaps for transcriptomics and metabolomics were each made as one large heatmap for figures 3, 4, 6, with gaps separating the different pathways. For transcriptomics, dummy rows were included to ensure scales are the same as for the heatmap in figure 7, and the heatmap was split into the separate figures in Illustrator.  
+
+Rate-limiting genes will be highlighted in bold/red in Illustrator
+
+
+Transcriptomics
+----------------
+
+```{r}
+read_tsv("metabolomics/genes_for_overall_metabolism_hm.txt", col_names = "Gene") %>%
+  mutate(Nascent_zscore = all_L2FC_norm$Nascent_zscore[match(Gene, all_L2FC_norm$Gene)]) %>%
+  mutate(Stability_zscore = all_L2FC_norm$Stability_zscore[match(Gene, all_L2FC_norm$Gene)]) %>%
+  mutate(RNA_zscore = all_L2FC_norm$RNA_zscore[match(Gene, all_L2FC_norm$Gene)]) %>%
+  mutate(Ribo_zscore = all_L2FC_norm$Ribo_zscore[match(Gene, all_L2FC_norm$Gene)]) %>%
+    mutate(Nascent_padj = res_4sU$padj[match(Gene, res_4sU$Gene)]) %>%
+    mutate(Stability_padj = Stability_differences$fdr.value[match(Gene, Stability_differences$Gene)]) %>%
+    mutate(RNA_padj = res_RNA$padj[match(Gene, res_RNA$Gene)]) %>%
+    mutate(Ribo_padj = res_Ribo$padj[match(Gene, res_Ribo$Gene)]) %>%
+      mutate(Nascent_pval = res_4sU$pvalue[match(Gene, res_4sU$Gene)]) %>%
+      mutate(Stability_pval = Stability_differences$p.value[match(Gene, Stability_differences$Gene)]) %>%
+      mutate(RNA_pval = res_RNA$pvalue[match(Gene, res_RNA$Gene)]) %>%
+      mutate(Ribo_pval = res_Ribo$pvalue[match(Gene, res_Ribo$Gene)]) %>%
+        mutate(RNA_Ctrl_expression = norm_counts_RNA$Ctrl_mean[match(Gene, norm_counts_RNA$Gene)]) %>%
+          mutate(Darnell_72h_3UTR_sum_n90 = if_else(Gene %in% CLIP_72h_3UTR_sum$Gene_name, CLIP_72h_3UTR_sum$sum_3UTR_72h_n90[match(Gene, CLIP_72h_3UTR_sum$Gene_name)], 0)) %>%
+          mutate(iCLIP_24h_3UTR_sum_n90 = if_else(Gene %in% iCLIP_24h_3UTR_sum$Gene_name, iCLIP_24h_3UTR_sum$sum_3UTR_24h_n90[match(Gene, iCLIP_24h_3UTR_sum$Gene_name)], 0)) %>%
+          mutate(Darnell_4h_3UTR_sum_n90 = if_else(Gene %in% CLIP_4h_3UTR_sum$Gene_name, CLIP_4h_3UTR_sum$sum_3UTR_4h_n90[match(Gene, CLIP_4h_3UTR_sum$Gene_name)], 0)) -> Metabolism_RNA_hm
+
+summary(Metabolism_RNA_hm)
+```
+Range of 0-20 for CLIP and 5-16 for expression (taking into account TFs in figure 7 - keep them the same)
+
+```{r}
+Metabolism_RNA_hm %>%
+  add_row(Gene ="dummy", Nascent_zscore = 0, Stability_zscore = 0, RNA_zscore =0, Ribo_zscore =0, Darnell_4h_3UTR_sum_n90 = 20, Darnell_72h_3UTR_sum_n90 =20, iCLIP_24h_3UTR_sum_n90 =20, RNA_Ctrl_expression = 5) %>%
+  add_row(Gene ="dummy2", Nascent_zscore = 0, Stability_zscore = 0, RNA_zscore =0, Ribo_zscore =0, Darnell_4h_3UTR_sum_n90 = 0, Darnell_72h_3UTR_sum_n90 =0, iCLIP_24h_3UTR_sum_n90 =0, RNA_Ctrl_expression = 16) -> Metabolism_RNA_hm
+```
+
+Separate out into z scores for main heatmap, annotations, and p values - convert these to stars depending on significance. 
+
+Symmetrical breaks for main colour scale will be the same as those used for TFs.
+
+For CLIP annotations - log transform values.
+
+```{r}
+Metabolism_RNA_hm %>%
+  select(1:5) %>%
+  column_to_rownames("Gene") ->
+    Metabolism_RNA_zscores
+
+
+Metabolism_RNA_hm %>%
+  mutate(Nascent_sig = case_when(
+    Nascent_padj < 0.05 ~ "***",
+    Nascent_pval < 0.05 ~ "**",
+    Nascent_pval < 0.1 ~ "*",
+    TRUE ~ ""
+  )) %>%
+  mutate(Stability_sig = case_when(
+    Stability_padj < 0.05 ~ "***",
+    Stability_pval < 0.05 ~ "**",
+    Stability_pval < 0.1 ~ "*",
+    TRUE ~ ""
+  )) %>%
+  mutate(RNA_sig = case_when(
+    RNA_padj < 0.05 ~ "***",
+    RNA_pval < 0.05 ~ "**",
+    RNA_pval < 0.1 ~ "*",
+    TRUE ~ ""
+  )) %>%
+  mutate(Ribo_sig = case_when(
+    Ribo_padj < 0.05 ~ "***",
+    Ribo_pval < 0.05 ~ "**",
+    Ribo_pval < 0.1 ~ "*",
+    TRUE ~ ""
+  )) %>%
+  select(Gene, ends_with("sig")) %>%
+  column_to_rownames("Gene") -> Metabolism_RNA_sig
+
+
+Metabolism_RNA_hm %>%
+  select(Gene, RNA_Ctrl_expression, ends_with("n90")) %>%
+  mutate_at(vars(ends_with("n90")), function(x) log2((10*x)+1)) %>%
+  column_to_rownames("Gene") -> Metabolism_RNA_annotations
+
+```
+
+
+Plot heatmap:
+
+```{r fig.height=15, fig.width=4.5}
+sym_breaks <- seq(-4.6, 4.6, length.out = 401)
+
+#pdf("Figure_panels/Fig3A_4A_RNA_hm.pdf", height = 15, width = 4.5)
+Metabolism_RNA_zscores %>%
+  pheatmap(cluster_rows = F,
+           cluster_cols = F,
+           breaks = sym_breaks, 
+           angle_col = 45, 
+           fontsize_row = 10,
+           color = c(colorRampPalette(colors = brewer.pal(11,"RdBu")[11:10])(100),colorRampPalette(colors = brewer.pal(11,"RdBu")[10:2])(200),colorRampPalette(colors = brewer.pal(11,"RdBu")[2:1])(100)), 
+           display_numbers = Metabolism_RNA_sig, 
+           annotation_row = Metabolism_RNA_annotations,
+           annotation_colors = list(
+             Darnell_72h_3UTR_sum_n90 = brewer.pal(9, "Greens"),
+             Darnell_4h_3UTR_sum_n90 = brewer.pal(9, "Greens"),
+             iCLIP_24h_3UTR_sum_n90 = brewer.pal(9, "Greens"),
+             RNA_Ctrl_expression = brewer.pal(9, "Purples")
+           ),
+           fontsize_number = 14,
+           annotation_legend = F,
+           gaps_row = c(21, 28, 31, 41, 47, 69, 78, 83, 88, 92))
+#dev.off()
+```
+
+
+Metabolomics
+-------------
+
+Heatmap is generated from the LCMS data (without glucose or glutamine tracing)
+
+Results were first collated in Excel, raw values normalised to the total metabolite abundance for each sample, and p values calcuated by unpaired, two-tailed t-test.
+
+```{r}
+read_tsv("metabolomics/collated_metabolomics_JWest_norm_total_metabolites.txt") ->
+  all_metabolomics_LCMS
+
+all_metabolomics_LCMS %>%
+  select(2:14) %>%
+  column_to_rownames("Metabolite") %>%
+  log2() ->
+    all_metabolites_total_scaled
+
+all_metabolites_total_scaled - rowMeans(all_metabolites_total_scaled) -> all_metabolites_total_scaled
+
+sym_breaks_met_total <- seq(-max(abs(all_metabolites_total_scaled)), max(abs(all_metabolites_total_scaled)), length.out = 101)
+
+all_metabolomics_LCMS %>%
+  mutate(Ctrl_mean = if_else(grepl("oA", Metabolite), NA_real_, log2(rowMeans(select(all_metabolomics_LCMS, starts_with("WT")))))) ->
+  all_metabolomics_LCMS
+all_metabolomics_LCMS %>%
+  select(2, P_value, Ctrl_mean) %>%
+    mutate(P_value = case_when(
+      P_value < 0.05 ~ "p < 0.05",
+      P_value < 0.1 ~ "p < 0.1",
+      TRUE ~ "n.s."
+    )) %>%
+    column_to_rownames("Metabolite") -> 
+      met_annotations_total
+```
+
+Plot data:
+
+```{r fig.height=8, fig.width=5.5}
+#pdf("Figure_panels/Fig6A_met_hm.pdf", height=8, width =5.5, useDingbats = F)
+all_metabolites_total_scaled %>%
+  pheatmap(cluster_rows = F,
+           cluster_cols = F,
+           color = colorRampPalette(rev(brewer.pal(11,"PuOr")[2:10]))(100),
+           breaks = sym_breaks_met_total,
+           annotation_row = met_annotations_total,
+           annotation_colors = list(
+             P_value = c(n.s. = "grey", "p < 0.1" = "paleturquoise", "p < 0.05" = "darkturquoise"),
+             Ctrl_mean = brewer.pal(9,"Blues")
+             ),
+           gaps_row = c(9,14,29,39, 49))
+#dev.off()
+```
+
+Calculate fold change (non-log transformed) and export for supplementary table
+
+
+### Table S9 - LC-MS
+
+```{r}
+all_metabolomics_LCMS %>%
+  mutate(Ctrl_mean_lin = rowMeans(select(all_metabolomics_LCMS, starts_with("WT")))) %>%
+  mutate(dKO_mean_lin = rowMeans(select(all_metabolomics_LCMS, starts_with("KO")))) %>%
+  mutate(fold_change = dKO_mean_lin/Ctrl_mean_lin) %>%
+  write_tsv("Supplementary_tables/TableS9_LCMS.txt") # then delete the columns I don't want in excel
+```
+
+
+Figure S3F - LC-MS
+===================
+
+For some of the glutamine/TCA related metabolites, I will also include bar plots (with points) to make trend clearer
+
+```{r fig.height=1.7, fig.width=12}
+all_metabolomics_LCMS %>%
+  pivot_longer(c(starts_with("WT"), starts_with("KO")), names_to = "Sample", values_to = "Abundance") %>%
+  mutate(Genotype = if_else(grepl("WT", Sample), "Ctrl", "dKO")) %>%
+  filter(Symbol %in% c("Gln", "Glu", "AKG", "Citrate", "Aco", "Isocitrate", "SUC", "FUM", "Mal")) %>%
+  ggplot(aes(x = Genotype, y = Abundance, shape = Genotype, fill = Genotype)) +
+    stat_summary(geom = "bar", fun = mean, colour = "black") +
+    geom_jitter(height = 0, width = 0.3, size = 2) +
+    facet_wrap(~Metabolite, scales = "free", nrow = 1) +
+    scale_fill_manual(values = c("grey50", "white")) +
+    scale_shape_manual(values = c(16,1)) +
+    theme_bw() +
+    scale_y_continuous(expand = expansion(mult = c(0,0.1))) +
+    labs(x = NULL, y = "Relative Abundance") +
+    theme(panel.background = element_blank(), plot.background = element_blank(), legend.key = element_blank(), legend.background = element_blank())
+ggsave("Figure_panels/FigS3F_LCMS_bar.pdf")
+```
+
+
+
+
+Figures 3B and 4B - dotplot for Ribo-seq/CLIP
+===============================================
+
+For the same genes as included in the heatmap, want a dotplot where the colour for each gene represents its z-score in Riboseq, and diamonds around the outside represent CLIP binding (sum of reads in 72h dataset - no need to norm to 90th percentile in this case since just one dataset, can show absolute scale).
+
+These will then be used and moved round in Illustrator to create pathway figures.  
+
+```{r}
+Metabolism_RNA_hm %>%
+  left_join(CLIP_72h_3UTR_sum, by = c("Gene" = "Gene_name")) %>%
+  mutate(sum_3UTR_72h = if_else(is.na(sum_3UTR_72h), 0, sum_3UTR_72h)) -> Metabolism_RNA_hm
+```
+
+There are 94 rows in the dataframe - last 2 are 'dummy' which we don't need here - plot in a 10x10 grid. 
+
+```{r fig.height=7, fig.width=9}
+Metabolism_RNA_hm %>%
+  add_column(y_offset = c(rep(1,10), rep(2, 10), rep(3,10), rep(4,10), rep(5,10), rep(6, 10), rep(7,10), rep(8,10), rep(9,10), rep(10,2), NA, NA)) %>%
+  add_column(x_offset = c(rep(seq(1,10), 9), 1, 2, NA, NA)) %>%
+  ggplot(aes(x_offset, y_offset))  +
+    geom_point(aes(colour = Ribo_zscore), size = 14) +
+    scale_colour_gradientn(colours = c(colorRampPalette(colors = brewer.pal(11,"RdBu")[11:10])(100),colorRampPalette(colors = brewer.pal(11,"RdBu")[10:2])(200),colorRampPalette(colors = brewer.pal(11,"RdBu")[2:1])(100)), 
+                           limits = c(-4.6, 4.6)) +
+    geom_text(aes(label = Gene)) +
+    geom_point(aes(alpha = sum_3UTR_72h), colour= "grey20", shape = 5, size = 14, stroke = 1) +
+    scale_alpha_continuous(range =c(0,1)) +
+    theme(axis.line = element_blank(), axis.ticks = element_blank(), axis.title = element_blank(), axis.text = element_blank())
+
+ggsave("Figure_panels/Fig3B_4B_dotplot.pdf", useDingbats = F)
+
+```
+
+Figure 5G-I - rate-limiting genes
+===================================
+
+Made lists of genes encoding rate limiting enzymes/transporters in metabolic pathways
+
+Classified a gene as rate limiting if either described by at least 2 references as being rate limiting, or supported by a single reference in which it is demonstrated to be so.
+(Tried filtering against list of genes from RLEdb but this classes almost everything as rate limiting!)
+
+Need to convert these into lists of ensembl IDs.
+
+
+```{r}
+read_tsv("metabolomics/rate_limiting2.txt") %>%
+  filter(!is.na(Rate_limiting)) -> rateLim_genes
+
+rateLim_genes %>%
+  filter(Rate_limiting == T) %>%
+  pull(Gene_ID) %>%
+  write("metabolomics/rateLim2_ID.txt")
+
+rateLim_genes %>%
+  filter(Rate_limiting == F) %>%
+  pull(Gene_ID) %>%
+  write("metabolomics/nonRateLim2_ID.txt")
+
+```
+
+Enrichment for CLIP targets
+---------------------------
+
+Ran CLIP enrichment pipeline for each of the CLIP datasets with each list, eg:
+Rscript --vanilla expression_match_iCLIP.R rateLim_ID.txt CLIP_4h_exMatch.RData
+
+
+Read in outputs and collate into a single dataframe:
+
+```{r}
+list(
+  readRDS("metabolomics/rateLim2_ID_CLIP_4h_exMatch_expressionMatch_processed_data.rds") %>%
+  sapply(function(x) add_column(x, datasets = "rateLim_4h")),
+  readRDS("metabolomics/nonRateLim2_ID_CLIP_4h_exMatch_expressionMatch_processed_data.rds") %>%
+  sapply(function(x) add_column(x, datasets = "nonRateLim_4h")),
+  readRDS("metabolomics/rateLim2_ID_iCLIP_24h_exMatch_expressionMatch_processed_data.rds") %>%
+  sapply(function(x) add_column(x, datasets = "rateLim_24h")),
+  readRDS("metabolomics/nonRateLim2_ID_iCLIP_24h_exMatch_expressionMatch_processed_data.rds") %>%
+  sapply(function(x) add_column(x, datasets = "nonRateLim_24h")),
+  readRDS("metabolomics/rateLim2_ID_CLIP_72h_exMatch_expressionMatch_processed_data.rds") %>%
+  sapply(function(x) add_column(x, datasets = "rateLim_72h")),
+  readRDS("metabolomics/nonRateLim2_ID_CLIP_72h_exMatch_expressionMatch_processed_data.rds") %>%
+  sapply(function(x) add_column(x, datasets = "nonRateLim_72h"))
+) -> all_rate_lim2_CLIPenr
+
+
+
+tibble(Datasets=sapply(all_rate_lim2_CLIPenr, function(x) x[[1]][1,"datasets"]),
+       Total_overlaps=sapply(all_rate_lim2_CLIPenr, function(x) sum(x[[1]]$iCLIP_hit)), 
+       ExMatch_median=sapply(all_rate_lim2_CLIPenr, function(x) median(x[[2]]$Overlap)), 
+       ExMatch_q95=sapply(all_rate_lim2_CLIPenr, function(x) x[[2]][1,2]), 
+       ExMatch_q5=sapply(all_rate_lim2_CLIPenr, function(x) x[[2]][1,3])) %>%
+  mutate(Overlap_enrichment = Total_overlaps/ExMatch_median) %>%
+  mutate(q5_enrichment = ExMatch_q5/ExMatch_median) %>%
+  mutate(q95_enrichment = ExMatch_q95/ExMatch_median) %>%
+  separate(Datasets, c("Type", "CLIPdata")) %>%
+  mutate(CLIPdata = factor(CLIPdata, levels = c("4h", "24h", "72h"))) -> summary_ratelim2_CLIP
+
+
+
+```
+
+### Plot data
+
+
+```{r fig.height=3, fig.width=5}
+summary_ratelim2_CLIP %>%
+  ggplot(aes(x = CLIPdata, y = Overlap_enrichment)) +
+    geom_col(fill = "mediumturquoise") + 
+    geom_col(aes(y = 1), fill = "darkcyan", width=0.7) +
+    geom_errorbar(aes(ymin = q5_enrichment, ymax = q95_enrichment), width=0.5) +
+    facet_grid(~ Type) +
+    theme_bw() +
+    theme(panel.background = element_blank(), plot.background = element_blank())
+ggsave("Figure_panels/Fig5G_Rate_limiting_CLIP_enrich_v2.pdf")
+
+
+```
+
+ARE enrichment
+----------------
+
+
+Just for exMatched with 72h CLIP data - ran through TATT analysis pipeline, eg:
+Rscript --vanilla TATT_analysis.R rateLim_ID_CLIP_72h_exMatch_expression_matched.txt Mus_musculus.GRCm38.90.gtf
+
+### Collate and plot data
+
+```{r fig.height = 3, fig.width = 3}
+read_tsv("metabolomics/TATT_rateLim2_ID_CLIP_72h_exMatch_expression_matched.txt") %>%
+  filter(Type != "Random") %>%
+  group_by(Type, Gene_set) %>%
+  summarise(TATTTATT = sum(nTATTTATT > 0)) %>%
+  summarise(median = median(TATTTATT), q5 = quantile(TATTTATT, 0.05), q95 = quantile(TATTTATT, 0.95)) %>%
+  add_column(rateLim = "RateLim") -> TATTTATT_ratelim2
+
+read_tsv("metabolomics/TATT_nonRateLim2_ID_CLIP_72h_exMatch_expression_matched.txt") %>%
+  filter(Type != "Random") %>%
+  group_by(Type, Gene_set) %>%
+  summarise(TATTTATT = sum(nTATTTATT > 0)) %>%
+  summarise(median = median(TATTTATT), q5 = quantile(TATTTATT, 0.05), q95 = quantile(TATTTATT, 0.95)) %>%
+  add_column(rateLim = "NonRateLim") -> TATTTATT_nonratelim2
+```
+
+
+```{r fig.height = 3, fig.width = 2.5}
+bind_rows(TATTTATT_ratelim2, TATTTATT_nonratelim2) %>%
+  mutate(Type = if_else(Type == "Expression matched", "Expression_matched", "ratelim")) %>%
+  pivot_wider(id_cols = rateLim, names_from = Type, values_from = c(median, q5, q95)) %>%
+  mutate(across(-rateLim, ~ .x/median_Expression_matched)) -> TATTTATT_ratelim2_summary_norm
+
+TATTTATT_ratelim2_summary_norm %>%
+  ggplot(aes(x = rateLim, y = median_ratelim)) +
+    geom_col(fill = brewer.pal(6,"Purples")[4]) + 
+    geom_col(aes(y = 1), fill = brewer.pal(6,"Purples")[6], width=0.7) +
+    geom_errorbar(aes(ymin = q5_Expression_matched, ymax = q95_Expression_matched), width=0.5) +
+    theme_bw() +
+    theme(plot.background = element_blank(), panel.background = element_blank())
+ggsave("Figure_panels/Fig5H_Rate_limiting_TATT_enrich_v2.pdf")
+```
+
+
+Expression of rate limiting vs non-rate limiting genes
+------------------------------------------------------
+
+```{r}
+rateLim_genes %>%
+  left_join(all_L2FC_norm, by = "Gene") %>%
+  pivot_longer(ends_with("zscore"), names_to = "Metric", values_to = "Zscore") %>%
+  mutate(Metric = sub("_zscore", "", Metric)) %>%
+  mutate(Metric = factor(Metric, levels = c("Nascent", "Stability", "RNA","Ribo"))) -> rateLim_genes_long
+```
+
+
+```{r fig.height=2.5, fig.width=5}
+rateLim_genes_long %>%
+  ggplot(aes(x = Metric, y= Zscore, fill = Rate_limiting)) +
+    geom_boxplot(outlier.size = 0.5) +
+    scale_fill_brewer(palette = "Accent") +
+    geom_hline(yintercept = 0, linetype = "dashed", colour = "grey40") +
+    labs(x = NULL, y = "Z-score (dKO/Ctrl)")
+ggsave("Figure_panels/Fig5I_RateLimiting_zscores.pdf")
+```
+
+```{r}
+rateLim_genes_long %>%
+  group_by(Metric) %>%
+  t_test(Zscore ~ Rate_limiting) %>% 
+  mutate(padj = p.adjust(p, method ="fdr"))
+```
+
+Table S8 - rate-limiting genes
+------------------------------
+
+Export for supplement. This will be combined with the references supporting definition of rate-limiting genes in Excel.
+
+```{r}
+read_tsv("metabolomics/TATT_rateLim2_ID_CLIP_72h_exMatch_expression_matched.txt") %>%
+  bind_rows(read_tsv("metabolomics/TATT_nonRateLim2_ID_CLIP_72h_exMatch_expression_matched.txt")) %>%
+  filter(grepl("ateLim", Type)) %>%
+  select(Gene, nTATTTATT, transcript_id) -> rateLim_TATTTATT
+
+rateLim_genes %>%
+  left_join(select(all_L2FC_norm, Gene, Nascent_zscore, Stability_zscore, RNA_zscore, Ribo_zscore)) %>%
+  mutate(CLIP_4h = Gene_ID %in% Darnell_4h_3UTR_targets) %>%
+  mutate(iCLIP_24h = Gene_ID %in% iCLIP_24h_3UTR_targets) %>%
+  mutate(CLIP_72h = Gene_ID %in% Darnell_72h_3UTR_targets) %>%
+  left_join(rateLim_TATTTATT, by = c("Gene_ID" = "Gene")) %>%
+  write_tsv("Supplementary_tables/TableS8_rateLim.txt")
+
+```
+
+Figure 6C: glucose measurements
+===============================
+
+```{r fig.height = 3, fig.width=3}
+as_tibble(read_pzfx("metabolomics/glucose_measurements/Babraham Project WT vs KO Sups Glucose.pzfx", table = 1)) %>%
+  add_column(Experiment = "A") %>%
+  bind_rows(add_column(as_tibble(read_pzfx("metabolomics/glucose_measurements/Babraham Project WT vs KO Sups Glucose.pzfx", table = 2)), Experiment= "B")) %>%
+  pivot_longer(-Experiment, names_to = "Genotype", values_to = "Glucose_mmolL") %>%
+  mutate(Genotype = factor(Genotype, levels= c("WT","KO"), labels = c("Ctrl", "dKO"))) -> glucose_measurements
+
+glucose_measurements %>%
+  t_test(Glucose_mmolL ~ Genotype) %>%
+  pull(p) -> glucose_ttest
+  
+glucose_measurements %>%
+  ggplot(aes(x = Genotype, y = Glucose_mmolL, fill = Genotype)) +
+    stat_summary(geom = "crossbar", fun = mean, fun.min = mean, fun.max = mean, width = 0.8) +
+    geom_point(aes(shape = Experiment), position = position_jitter(height = 0, width = 0.3), size = 3) +
+    scale_shape_manual(values = c(21, 24)) +
+    coord_cartesian(ylim = c(0,13.5)) +
+    scale_y_continuous(expand = c(0,0)) +
+    scale_fill_manual(values = c("black", "transparent")) +
+    annotate("text", x = 1.5, y= 12.8, label = paste("p =", glucose_ttest)) +
+    labs(x= NULL, y = "Glucose (mmol/L)")
+ggsave("Figure_panels/Fig6C_Glucose_measurements.pdf", useDingbats = F)
+```
+
+Figure 6D: lactate measurements
+===============================
+
+```{r fig.height = 3, fig.width=3}
+as_tibble(read_pzfx("metabolomics/lactate_measurements/Babraham Project WT vs KO Sups Lactate.pzfx", table = 1)) %>%
+  pivot_longer(everything(),names_to = "Genotype", values_to = "Lactate_mmolL") %>%
+  mutate(Genotype = factor(Genotype, levels= c("WT","KO"), labels = c("Ctrl", "dKO"))) -> lactate_measurements
+
+lactate_measurements %>%
+  t_test(Lactate_mmolL ~ Genotype) %>%
+  pull(p) -> lactate_ttest
+  
+lactate_measurements %>%
+  ggplot(aes(x = Genotype, y = Lactate_mmolL, fill = Genotype)) +
+    stat_summary(geom = "crossbar", fun = mean, fun.min = mean, fun.max = mean, width = 0.8) +
+    geom_point(shape = 21, position = position_jitter(height = 0, width = 0.3), size = 3) +
+    coord_cartesian(ylim = c(0,4.8)) +
+    scale_y_continuous(expand = c(0,0)) +
+    scale_fill_manual(values = c("black", "transparent")) +
+    annotate("text", x = 1.5, y= 4.6, label = paste("p =", lactate_ttest)) +
+    labs(x= NULL, y = "Lactate (mmol/L)")
+ggsave("Figure_panels/Fig6D_Lactate_measurements.pdf", useDingbats = F)
+```
+
+Figures 6B and E: Glucose tracing
+====================================
+
+Results were collated in Excel: calculated ion counts normalised to internal standard, and overall fractional labelling. Also calculated fractional labelling * norm ion counts, as a measure of labelled ion counts. 
+
+```{r}
+read_tsv("metabolomics/glucose_tracing/Norm_ion_counts.txt") %>%
+  mutate(Metabolite = sub("_.*", "", Fragment)) %>%
+  select(-Fragment) %>%
+  pivot_longer(-Metabolite, names_to = "Genotype", values_to = "Relative_abundance") %>%
+  mutate(Genotype = factor(sub(" .*", "", sub("HM ", "", Genotype)), levels = c("WT", "KO"), labels = c("Ctrl", "dKO"))) -> Glucose_tracing_ion_counts
+read_tsv("metabolomics/glucose_tracing/Fractional_labelling_x_ion_count.txt") %>%
+  mutate(Metabolite = sub("_.*", "", Fragment)) %>%
+  select(-Fragment) %>%
+  pivot_longer(-Metabolite, names_to = "Genotype", values_to = "Relative_abundance") %>%
+  mutate(Genotype = factor(sub(" .*", "", sub("HM ", "", Genotype)), levels = c("WT", "KO"), labels = c("Ctrl", "dKO"))) -> Glucose_tracing_labelled_ion_counts
+```
+
+
+Stats
+-----
+
+T-tests (unpaired, 2-tailed) for dKO vs Control, for both total ion counts, and labelled ion counts (ie total ion count * fractional labelling)
+
+```{r}
+Glucose_tracing_ion_counts %>%
+  group_by(Metabolite) %>%
+  t_test(Relative_abundance ~ Genotype) -> gluc_total_stats
+Glucose_tracing_labelled_ion_counts %>%
+  group_by(Metabolite) %>%
+  t_test(Relative_abundance ~ Genotype) -> gluc_labelled_stats
+
+gluc_total_stats
+gluc_labelled_stats
+
+```
+
+T-test outputs will be added onto figures in Illustrator
+
+Plot data
+---------
+
+Define plotting function (can be used for glutamine tracing later as well):
+
+```{r}
+plot_abundance_with_labelled <- function(metabolite, ion_data = Glucose_tracing_ion_counts, labelled_data = Glucose_tracing_labelled_ion_counts, colour = "black", title = metabolite) {
+  ion_data <- filter(ion_data, Metabolite == metabolite)
+  labelled_data <- filter(labelled_data, Metabolite == metabolite)
+  
+  ion_data %>%
+    ggplot(aes(x = Genotype, y = Relative_abundance)) +
+      stat_summary(geom = "bar", fun = mean, fill = "transparent", colour = colour, width = 0.7, size = 1) +
+      stat_summary(geom = "errorbar", fun.min = mean, fun.max = function(y) {mean(y) + sd(y)}, width= 0.4, colour= colour, size = 1) +
+      stat_summary(data = labelled_data, geom = "bar", fun = mean, colour = colour, fill = colour, width = 0.7, size = 1) +
+      stat_summary(data = labelled_data, geom = "errorbar", fun.min = mean, fun.max = function(y) {mean(y) + sd(y)}, width= 0.4, colour= colour, size = 1) +
+      labs(x = NULL, y = "Relative abundance", title = title) +
+      scale_y_continuous(expand = expansion(mult = c(0, 0.2)))
+}
+```
+
+Plot metabolites we want to show in figures - export PDF for Fig 6B, save the rest into objects to arrange together with glutamine tracing.
+
+```{r fig.height = 8, fig.width = 5.5}
+plot_abundance_with_labelled("Pyr", title = "Pyruvate") -> pGlcPyr
+plot_abundance_with_labelled("Lac", title = "Lactate") -> pGlcLac
+plot_abundance_with_labelled("Ser", title = "Serine") -> pGlcSer
+plot_abundance_with_labelled("Glu", title = "Glutamate") -> pGlcGlu
+plot_abundance_with_labelled("Akg", title = "Alpha-ketoglutarate") -> pGlcAkg
+plot_abundance_with_labelled("Mal", title = "Malate") -> pGlcMal
+plot_abundance_with_labelled("Fum", title = "Fumarate") -> pGlcFum
+plot_abundance_with_labelled("Asp", title = "Aspartate") -> pGlcAsp
+plot_abundance_with_labelled("Cit", title = "Citrate") -> pGlcCit
+plot_abundance_with_labelled("Suc", title = "Succinate") -> pGlcSuc
+
+ggarrange(pGlcPyr, pGlcLac, pGlcSer, pGlcGlu, pGlcAkg, pGlcMal, pGlcFum, pGlcAsp, pGlcCit, pGlcSuc, nrow = 3)
+
+#pdf("Figure_panels/Fig6B_glucLab.pdf", height = 3, width = 5.5)
+ggarrange(pGlcPyr, pGlcLac, pGlcSer, nrow = 1)
+#dev.off()
+```
+
+
+Figure 6E-F; S3G: glutamine tracing
+====================================
+
+Read in data
+------------
+
+Read in tables excluding outliers for plotting and stats
+
+```{r}
+read_tsv("metabolomics/glutamine_tracing/Norm_ion_counts_excl_outliers.txt") %>%
+  mutate(Metabolite = sub("_.*", "", Fragment)) %>%
+  select(-Fragment) %>%
+  pivot_longer(-Metabolite, names_to = "Genotype", values_to = "Relative_abundance") %>%
+  mutate(Genotype = factor(sub(" ?[0-9]", "", Genotype), levels = c("WT", "KO"), labels = c("Ctrl", "dKO"))) %>%
+  na.omit() -> Glutamine_tracing_ion_counts
+read_tsv("metabolomics/glutamine_tracing/Fractional_labelling_x_ion_count.txt") %>%
+  mutate(Metabolite = sub("_.*", "", Fragment)) %>%
+  select(-Fragment) %>%
+  pivot_longer(-Metabolite, names_to = "Genotype", values_to = "Relative_abundance") %>%
+  mutate(Genotype = factor(sub(" ?[0-9]", "", Genotype), levels = c("WT", "KO"), labels = c("Ctrl", "dKO"))) %>%
+  na.omit() -> Glutamine_tracing_labelled_ion_counts
+```
+
+Stats
+-----
+
+T-tests (unpaired, 2-tailed) for dKO vs Control, for both total ion counts, and labelled ion counts (ie total ion count * fractional labelling)
+
+```{r}
+Glutamine_tracing_ion_counts %>%
+  group_by(Metabolite) %>%
+  t_test(Relative_abundance ~ Genotype) -> glut_total_stats
+Glutamine_tracing_labelled_ion_counts %>%
+  group_by(Metabolite) %>%
+  t_test(Relative_abundance ~ Genotype) -> glut_labelled_stats
+
+glut_total_stats
+glut_labelled_stats
+
+```
+
+T-test outputs will be added onto figures in Illustrator
+
+Plot data (6E)
+--------------
+
+```{r fig.height = 10, fig.width = 8}
+plot_abundance_with_labelled("Glu", ion_data = Glutamine_tracing_ion_counts, labelled_data = Glutamine_tracing_labelled_ion_counts, colour = "dodgerblue3", title = "Glutamate") -> pGluGlu
+plot_abundance_with_labelled("Akg", ion_data = Glutamine_tracing_ion_counts, labelled_data = Glutamine_tracing_labelled_ion_counts, colour = "dodgerblue3", title = "Alpha-ketogluatarate") -> pGluAkg
+plot_abundance_with_labelled("Mal", ion_data = Glutamine_tracing_ion_counts, labelled_data = Glutamine_tracing_labelled_ion_counts, colour = "dodgerblue3", title = "Malate") -> pGluMal
+plot_abundance_with_labelled("Fum", ion_data = Glutamine_tracing_ion_counts, labelled_data = Glutamine_tracing_labelled_ion_counts, colour = "dodgerblue3", title = "Fumarate") -> pGluFum
+plot_abundance_with_labelled("Asp", ion_data = Glutamine_tracing_ion_counts, labelled_data = Glutamine_tracing_labelled_ion_counts, colour = "dodgerblue3", title = "Aspartate") -> pGluAsp
+plot_abundance_with_labelled("Cit", ion_data = Glutamine_tracing_ion_counts, labelled_data = Glutamine_tracing_labelled_ion_counts, colour = "dodgerblue3", title = "Citrate") -> pGluCit
+plot_abundance_with_labelled("Suc", ion_data = Glutamine_tracing_ion_counts, labelled_data = Glutamine_tracing_labelled_ion_counts, colour = "dodgerblue3", title = "Succinate") -> pGluSuc
+
+#pdf("Figure_panels/Fig6E_glucglut_tracing.pdf", height = 10, width = 8)
+ggarrange(pGlcGlu, pGluGlu, pGlcAkg, pGluAkg, pGlcFum, pGluFum, pGlcMal, pGluMal, pGlcAsp, pGluAsp, pGlcCit, pGluCit, pGlcSuc, pGluSuc, ncol = 4)
+#dev.off()
+```
+
+Figure 6F - aKG:succinate ratios
+---------------------------------
+
+```{r}
+all_metabolomics_LCMS %>%
+  select(Metabolite, starts_with("WT"), starts_with("KO")) %>%
+  pivot_longer(-Metabolite, names_to = "Sample", values_to = "Abundance") %>%
+  pivot_wider(names_from = Metabolite, values_from =Abundance) %>%
+  mutate(aKG_succ_ratio = `Alpha-ketoglutarate`/Succinate) %>%
+  mutate(Genotype = if_else(grepl("WT", Sample), "Ctrl", "dKO")) %>%
+  select(Genotype, aKG_succ_ratio) %>%
+  add_column(Dataset ="LCMS") %>%
+  bind_rows({
+    read_tsv("metabolomics/glucose_tracing/Norm_ion_counts.txt") %>%
+      mutate(Metabolite = sub("_.*", "", Fragment)) %>%
+      select(-Fragment) %>%
+      pivot_longer(-Metabolite, names_to = "Sample", values_to = "Relative_abundance") %>%
+      mutate(Sample = gsub(" ", "_", Sample)) %>%
+      pivot_wider(names_from = Metabolite, values_from =  Relative_abundance) %>%
+      mutate(aKG_succ_ratio = Akg/Suc) %>%
+      mutate(Genotype = if_else(grepl("WT", Sample), "Ctrl", "dKO")) %>%
+      select(Genotype, aKG_succ_ratio) %>%
+      add_column(Dataset = "Glucose_tracing")
+  }) %>%
+  bind_rows({
+    read_tsv("metabolomics/glutamine_tracing/Norm_ion_counts_excl_outliers.txt") %>%
+      mutate(Metabolite = sub("_.*", "", Fragment)) %>%
+      select(-Fragment) %>%
+      pivot_longer(-Metabolite, names_to = "Sample", values_to = "Relative_abundance") %>%
+      mutate(Sample = gsub(" ", "", Sample)) %>%
+      pivot_wider(names_from = Metabolite, values_from =  Relative_abundance) %>%
+      mutate(aKG_succ_ratio = Akg/Suc) %>%
+      mutate(Genotype = if_else(grepl("WT", Sample), "Ctrl", "dKO")) %>%
+      select(Genotype, aKG_succ_ratio) %>%
+      add_column(Dataset = "Glutamine_tracing")
+  }) -> aKG_ratios
+```
+
+
+```{r fig.height=2.5, fig.width=3.5}
+aKG_ratios %>%
+  t_test(aKG_succ_ratio ~ Genotype)
+
+
+aKG_ratios %>%
+  ggplot(aes(x = Genotype, y = aKG_succ_ratio, fill = Genotype)) +
+    stat_summary(geom = "bar", fun = mean, colour = "black") +
+    geom_jitter(aes(shape = Dataset), width = 0.3) +
+    scale_fill_manual(values = c("grey50", "transparent")) +
+    scale_shape_manual(values = c(16,17,4)) +
+    scale_y_continuous(expand = expansion(mult = c(0,0.05))) +
+    annotate("segment", x = 0.9, xend = 2.1, y = 0.19, yend= 0.19) +
+    annotate("text", x = 1.5, y = 0.21, label = paste("p =", {
+      aKG_ratios %>%
+        t_test(aKG_succ_ratio ~ Genotype) %>% pull(p)
+    })) +
+    labs(x = NULL, y = "aKG:succinate ratio")
+ggsave("Figure_panels/Fig6F_aKG_succ_ratio.pdf")
+
+```
+
+MIDs for selected metabolites (S3G)
+-----------------------------------
+
+Will just plot M3-M5 as these are the interesting ones
+
+```{r fig.height=2.2, fig.width=6}
+read_tsv("metabolomics/glutamine_tracing/MID_selected.txt") %>%
+  rename_with(~ sub(" ", "", .x)) %>%
+  pivot_longer(-Isotopomer, names_to = "Sample", values_to = "Fraction") %>%
+  mutate(MID = sub(".*\\((.*)\\).*", "\\1", Isotopomer)) %>%
+  mutate(Metabolite = sub("_.*", "", Isotopomer)) %>%
+  mutate(Genotype = factor(grepl("WT", Sample), levels = c(T,F), labels = c("Ctrl", "dKO"))) %>%
+  filter(MID %in% c("M3", "M4", "M5")) %>%
+  mutate(Metabolite = factor(Metabolite, levels = c("Cit", "Akg", "Fum", "Mal", "Asp"))) %>%
+  ggplot(aes(x = MID, y = Fraction, fill = Genotype, shape = Genotype)) +
+    stat_summary(geom = "bar", fun = mean, position = "dodge", colour = "black") +
+    geom_point(position = position_jitterdodge()) +
+    facet_grid(~Metabolite, scales = "free") +
+    theme_bw() +
+    scale_fill_manual(values = c("grey60", "white")) +
+    scale_shape_manual(values = c(16, 21))
+ggsave("Figure_panels/FigS3G_TCA_MID.pdf")
+```
+
+
+Table S10 - tracing experiments
+-------------------------------
+
+Export data for supplementary table:
+
+Combined glucose and glutamine
+
+```{r}
+read_tsv("metabolomics/glucose_tracing/Norm_ion_counts.txt") %>%
+  mutate(Metabolite = sub("_.*", "", Fragment)) %>%
+  select(-Fragment) %>%
+  left_join({
+    read_tsv("metabolomics/glucose_tracing/Fractional_labelling.txt") %>%
+  mutate(Metabolite = sub("_.*", "", Fragment)) %>%
+  select(-Fragment)
+  }, by = "Metabolite", suffix = c("_ion_counts", "_fractional_labelling")) %>%
+  left_join({
+    read_tsv("metabolomics/glucose_tracing/Fractional_labelling_x_ion_count.txt") %>%
+  mutate(Metabolite = sub("_.*", "", Fragment)) %>%
+  select(-Fragment) %>%
+      rename_with(~ sub("([0-9])", "\\1_ionxfraction", .x))
+  }, by = "Metabolite") %>%
+  rename_with(~ sub("HM (..) ", "\\1", .x)) %>%
+  left_join(select(gluc_total_stats, Metabolite, p), by = "Metabolite") %>%
+  left_join(select(gluc_labelled_stats, Metabolite, p), by = "Metabolite", suffix = c("_total", "_labelled")) %>%
+  select(Metabolite, ends_with("counts"), p_total, everything()) %>%
+  full_join({
+    read_tsv("metabolomics/glutamine_tracing/Norm_ion_counts.txt") %>%
+      mutate(Metabolite = sub("_.*", "", Fragment)) %>%
+      select(-Fragment) %>%
+      left_join({
+        read_tsv("metabolomics/glutamine_tracing/Fractional_labelling.txt") %>%
+      mutate(Metabolite = sub("_.*", "", Fragment)) %>%
+      select(-Fragment)
+      }, by = "Metabolite", suffix = c("_ion_counts", "_fractional_labelling")) %>%
+      left_join({
+        read_tsv("metabolomics/glutamine_tracing/Fractional_labelling_x_ion_count.txt") %>%
+      mutate(Metabolite = sub("_.*", "", Fragment)) %>%
+      select(-Fragment) %>%
+          rename_with(~ sub("([0-9])", "\\1_ionxfraction", .x))
+      }, by = "Metabolite") %>%
+      rename_with(~ sub(" ", "", .x)) %>%
+      left_join(select(glut_total_stats, Metabolite, p), by = "Metabolite") %>%
+      left_join(select(glut_labelled_stats, Metabolite, p), by = "Metabolite", suffix = c("_total", "_labelled")) %>%
+      select(Metabolite, ends_with("counts"), p_total, everything())
+  }, by = "Metabolite", suffix = c("_glucose", "_glutamine")) %>%
+  write_tsv("Supplementary_tables/TableS10_allLabelling.txt")
+
+```
+Means for control and KO in each metric calculated later in Excel.
+
+Results for individual isotopomers also copied directly from origninal table into Excel.
+
+
+Figure 7A-C: Glutamine titrations
+=======================================
+
+```{r fig.height=3, fig.width=4}
+read_tsv("Th1_diff/glutamine_titration_2.8.21.txt") %>%
+  add_column(Experiment = "A") %>%
+  bind_rows({
+    read_tsv("Th1_diff/glutamine_titration_13.8.21.txt") %>%
+      add_column(Experiment = "B")
+    }) %>% 
+  rename_with(~ gsub("\\+", "pos", .x)) %>% 
+  rename_with(~ gsub("-", "neg", .x)) %>%
+  mutate(Glutamine_mM = sub("Th1 (.*) ?mM.*", "\\1", Dataset)) %>%
+  mutate(Glutamine_mM = as.factor(sub("_", ".", Glutamine_mM))) %>%
+  mutate(Mouse = sub(".*mM_(.*?)_.*", "\\1", Dataset)) %>%
+  group_by(Experiment, Glutamine_mM, Mouse) %>%
+  summarise(Tbet = mean(Tbet), TbetgMFI = mean(TbetgMFI), EomesgMFI = mean(EomesgMFI), Eomes = mean(Eomes), EomesGzmbPoly = mean(EomesGzmbPoly), GzmbgMFIcons = mean(GzmbgMFIcons), TbetIfng = mean(TbetposIfngpos), EomesGzmb = mean(EomesposGzmbpos), .groups = "drop") %>%
+  mutate(Genotype = factor(grepl("WT", Mouse), levels = c(T,F), labels = c("Ctrl", "dKO"))) -> glutamine_titration_summary
+
+glutamine_titration_summary %>%
+  ggplot(aes(x = Glutamine_mM, y = TbetIfng, fill = Genotype, group = Genotype, shape = Experiment)) +
+    stat_summary(geom = "crossbar", fun = "mean", fun.min = "mean", fun.max = "mean", position = position_dodge(width = 0.8), width = 0.4) +
+    geom_point(position = position_jitterdodge(), size = 3) +
+    scale_fill_manual(values = c("black", "transparent")) +
+    scale_shape_manual(values = c(21, 24)) +
+    coord_cartesian(ylim = c(0,15)) +
+    labs(x = "Glutamine concentration (mM)", y = "% TBET+IFNg+") +
+    theme(legend.position = "none")
+ggsave("Figure_panels/Fig7A_glutamineTh1_TbetIFN.pdf")
+
+glutamine_titration_summary %>%
+  ggplot(aes(x = Glutamine_mM, y = EomesGzmbPoly, fill = Genotype, group = Genotype, shape = Experiment)) +
+    stat_summary(geom = "crossbar", fun = "mean", fun.min = "mean", fun.max = "mean", position = position_dodge(width = 0.8), width = 0.4) +
+    geom_point(position = position_jitterdodge(), size = 3) +
+    scale_fill_manual(values = c("black", "transparent")) +
+    scale_shape_manual(values = c(21, 24)) +
+    coord_cartesian(ylim = c(0,20)) +
+    labs(x = "Glutamine concentration (mM)", y = "% EOMES+GZMB+") +
+    theme(legend.position = "none")
+ggsave("Figure_panels/Fig7B_glutamineTh1_EomesGzmb.pdf")
+
+glutamine_titration_summary %>%
+  ggplot(aes(x = Glutamine_mM, y = GzmbgMFIcons, fill = Genotype, group = Genotype, shape = Experiment)) +
+    stat_summary(geom = "crossbar", fun = "mean", fun.min = "mean", fun.max = "mean", position = position_dodge(width = 0.8), width = 0.4) +
+    geom_point(position = position_jitterdodge(), size = 3) +
+    scale_fill_manual(values = c("black", "transparent")) +
+    scale_shape_manual(values = c(21, 24)) +
+    coord_cartesian(ylim = c(0,12000)) +
+    labs(x = "Glutamine concentration (mM)", y = "GZMB gMFI") +
+    theme(legend.position = "none")
+ggsave("Figure_panels/Fig7C_glutamineTh1_GzmbMFI.pdf")
+```
+
+Mann whitney tests
+
+```{r}
+glutamine_titration_summary %>%
+  group_by(Glutamine_mM) %>%
+  wilcox_test(TbetIfng ~ Genotype) %>%
+  ungroup() %>%
+  bind_rows({
+    glutamine_titration_summary %>%
+      group_by(Glutamine_mM) %>%
+      wilcox_test(EomesGzmbPoly ~ Genotype) %>%
+      ungroup()
+  }) %>%
+  bind_rows({
+    glutamine_titration_summary %>%
+      group_by(Glutamine_mM) %>%
+      wilcox_test(GzmbgMFIcons ~ Genotype) %>%
+      ungroup()
+  }) %>%
+  mutate(padj = p.adjust(p, "fdr"))
+```
+
+Calculate averages/differences/fold changes
+--------------------------------------------
+
+```{r}
+glutamine_titration_summary %>%
+  group_by(Glutamine_mM, Genotype) %>%
+  summarise(TbetIfng = mean(TbetIfng), EomesGzmbPoly = mean(EomesGzmbPoly), GzmbgMFIcons = mean(GzmbgMFIcons), .groups = "drop") %>%
+  pivot_wider(id_cols = Glutamine_mM, names_from = Genotype, values_from = c(TbetIfng,EomesGzmbPoly, GzmbgMFIcons)) %>%
+  mutate(TbetIfng_FC = TbetIfng_dKO/TbetIfng_Ctrl) %>%
+  mutate(TbetIfng_delta = TbetIfng_dKO-TbetIfng_Ctrl) %>%
+  mutate(EomesGzmbPoly_FC = EomesGzmbPoly_dKO/EomesGzmbPoly_Ctrl) %>%
+  mutate(EomesGzmbPoly_delta = EomesGzmbPoly_dKO-EomesGzmbPoly_Ctrl) %>%
+  mutate(GzmbgMFIcons_FC = GzmbgMFIcons_dKO/GzmbgMFIcons_Ctrl) %>%
+  mutate(GzmbgMFIcons_delta = GzmbgMFIcons_dKO-GzmbgMFIcons_Ctrl)
+```
+
+
+
+Figure 7D-E: aKG titrations
+==================================
+
+In the second experiment, there was an issue with the original genotyping - samples labelled ko1 and ko4 are actually controls.
+
+```{r fig.height=3, fig.width=4}
+read_tsv("Th1_diff/aKG_titration_23.11.21.txt") %>%
+  add_column(Experiment = "A") %>%
+  bind_rows({
+    read_tsv("Th1_diff/aKG_titration_13.12.21.txt") %>%
+      add_column(Experiment = "B") %>%
+      mutate(Dataset = sub("ko1", "wt6", sub("ko4", "wt7", Dataset)))
+    }) %>% 
+  rename_with(~ gsub("\\+", "pos", .x)) %>% 
+  rename_with(~ gsub("-", "neg", .x)) %>%
+  mutate(aKG_mM = sub("No Glutamine_(.*) aKG.*", "\\1", Dataset)) %>%
+  mutate(aKG_mM = as.factor(sub(" mM", "", sub("No", "0", sub("_", ".", aKG_mM))))) %>%
+  mutate(Mouse = sub(".*aKG (.*?)_.*", "\\1", Dataset)) %>%
+  group_by(Experiment, aKG_mM, Mouse) %>%
+  summarise(EomesGzmbPoly = mean(EomesGzmbPoly), GzmbgMFIcons = mean(GzmbgMFIcons), TbetIfng = mean(TbetposIfngpos), EomesGzmb = mean(EomesposGzmbpos), .groups = "drop") %>%
+  mutate(Genotype = factor(grepl("wt", Mouse), levels = c(T,F), labels = c("Ctrl", "dKO"))) -> aKG_titration_summary
+
+aKG_titration_summary %>%
+  ggplot(aes(x = aKG_mM, y = TbetIfng, fill = Genotype, group = Genotype, shape = Experiment)) +
+    stat_summary(geom = "crossbar", fun = "mean", fun.min = "mean", fun.max = "mean", position = position_dodge(width = 0.8), width = 0.4) +
+    geom_point(position = position_jitterdodge(), size = 3) +
+    scale_fill_manual(values = c("black", "transparent")) +
+    scale_shape_manual(values = c(21, 24)) +
+    #coord_cartesian(ylim = c(0,15)) +
+    labs(x = "aKG concentration (mM)", y = "% TBET+IFNg+") +
+    theme(legend.position = "none")
+ggsave("Figure_panels/Fig7D_aKGTh1_TbetIFN.pdf")
+
+aKG_titration_summary %>%
+  ggplot(aes(x = aKG_mM, y = EomesGzmbPoly, fill = Genotype, group = Genotype, shape = Experiment)) +
+    stat_summary(geom = "crossbar", fun = "mean", fun.min = "mean", fun.max = "mean", position = position_dodge(width = 0.8), width = 0.4) +
+    geom_point(position = position_jitterdodge(), size = 3) +
+    scale_fill_manual(values = c("black", "transparent")) +
+    scale_shape_manual(values = c(21, 24)) +
+    #coord_cartesian(ylim = c(0,20)) +
+    labs(x = "aKG concentration (mM)", y = "% EOMES+GZMB+") +
+    theme(legend.position = "none")
+ggsave("Figure_panels/Fig7E_aKGTh1_EomesGzmb.pdf")
+
+
+
+```
+Mann-whitney tests
+
+```{r}
+aKG_titration_summary %>%
+  group_by(aKG_mM) %>%
+  wilcox_test(TbetIfng ~ Genotype) %>%
+  ungroup() %>%
+  bind_rows({
+    aKG_titration_summary %>%
+      group_by(aKG_mM) %>%
+      wilcox_test(EomesGzmbPoly ~ Genotype) %>%
+      ungroup()
+  }) %>%
+  mutate(padj = p.adjust(p, "fdr"))
+```
+
+Figure 7F - transcriptomic read counts
+======================================
+
+Make tibble that contains normalised counts for RNA-seq, Ribo-seq and 4SU
+
+```{r}
+norm_counts_RNA %>%
+  left_join(norm_counts_Ribo) %>%
+  left_join(norm_counts_4sU) %>%
+  select(-ends_with("mean")) %>%
+  column_to_rownames("Gene") %>%
+  t() %>%
+  as_tibble(rownames = "Sample") %>%
+  mutate(Dataset = case_when(
+    grepl("^RF", Sample) ~ "Ribo",
+    grepl("^RNA", Sample) ~ "RNA",
+    TRUE ~ "4sU"
+  )) %>%
+  mutate(Dataset = factor(Dataset, levels = c("4sU", "RNA", "Ribo"))) %>%
+  mutate(Genotype = if_else(grepl("KO", Sample), "dKO", "Ctrl")) ->
+    all_norm_counts_t
+```
+
+
+Define function for plotting counts
+
+```{r}
+plot_gene_counts <- function(Gene) {
+  all_norm_counts_t %>%
+    ggplot(aes(x = Dataset, y = get(Gene), shape = Genotype, fill = Genotype)) +
+      stat_summary(geom = "bar", fun = "mean", position = "dodge", width = 0.8, colour = "black") +
+      geom_point(position = position_jitterdodge(jitter.width = 0.3, dodge.width = 0.8), size = 2) +
+      labs(x = NULL, y = paste(Gene, "normalised read counts")) +
+      scale_shape_manual(values = c(16, 1)) +
+      scale_fill_manual(values = c("grey60", "transparent")) +
+      scale_y_continuous(expand = expansion(mult  = c(0,0.1)))
+}
+
+```
+
+Plot for genes of interest
+
+```{r fig.height=2.5, fig.width=3.5}
+plot_gene_counts("Gzmb")
+ggsave("Figure_panels/Fig7F_Gzmb.pdf", useDingbats = F)
+plot_gene_counts("Prf1")
+ggsave("Figure_panels/Fig7F_Prf1.pdf", useDingbats = F)
+plot_gene_counts("Itgb1")
+ggsave("Figure_panels/Fig7F_Itgb1.pdf", useDingbats = F)
+```
+```{r}
+res_RNA %>%
+  filter(Gene %in% c("Gzmb", "Prf1", "Itgb1"))
+res_Ribo %>%
+  filter(Gene %in% c("Gzmb", "Prf1", "Itgb1"))
+res_4sU %>%
+  filter(Gene %in% c("Gzmb", "Prf1", "Itgb1"))
+```
+
+Stats from DESeq2 added in Illustrator
+
+
+Figure 7G - Th1 heatmap
+==========================
+
+```{r}
+tibble(Gene = c("Tbx21", "Eomes", "Runx3", "Zbtb7b", "Stat1", "Stat4", "Irf4", "Notch1", "Notch2", "Nfatc1", "Nfatc2", "Nfatc3", "Jun", "Fos", "Mitf", "Hopx", "Prdm1")) %>%
+  mutate(Nascent_zscore = all_L2FC_norm$Nascent_zscore[match(Gene, all_L2FC_norm$Gene)]) %>%
+  mutate(Stability_zscore = all_L2FC_norm$Stability_zscore[match(Gene, all_L2FC_norm$Gene)]) %>%
+  mutate(RNA_zscore = all_L2FC_norm$RNA_zscore[match(Gene, all_L2FC_norm$Gene)]) %>%
+  mutate(Ribo_zscore = all_L2FC_norm$Ribo_zscore[match(Gene, all_L2FC_norm$Gene)]) %>%
+    mutate(Nascent_padj = res_4sU$padj[match(Gene, res_4sU$Gene)]) %>%
+    mutate(Stability_padj = Stability_differences$fdr.value[match(Gene, Stability_differences$Gene)]) %>%
+    mutate(RNA_padj = res_RNA$padj[match(Gene, res_RNA$Gene)]) %>%
+    mutate(Ribo_padj = res_Ribo$padj[match(Gene, res_Ribo$Gene)]) %>%
+      mutate(Nascent_pval = res_4sU$pvalue[match(Gene, res_4sU$Gene)]) %>%
+      mutate(Stability_pval = Stability_differences$p.value[match(Gene, Stability_differences$Gene)]) %>%
+      mutate(RNA_pval = res_RNA$pvalue[match(Gene, res_RNA$Gene)]) %>%
+      mutate(Ribo_pval = res_Ribo$pvalue[match(Gene, res_Ribo$Gene)]) %>%
+        mutate(RNA_Ctrl_expression = norm_counts_RNA$Ctrl_mean[match(Gene, norm_counts_RNA$Gene)]) %>%
+          mutate(Darnell_72h_3UTR_sum_n90 = if_else(Gene %in% CLIP_72h_3UTR_sum$Gene_name, CLIP_72h_3UTR_sum$sum_3UTR_72h_n90[match(Gene, CLIP_72h_3UTR_sum$Gene_name)], 0)) %>%
+          mutate(iCLIP_24h_3UTR_sum_n90 = if_else(Gene %in% iCLIP_24h_3UTR_sum$Gene_name, iCLIP_24h_3UTR_sum$sum_3UTR_24h_n90[match(Gene, iCLIP_24h_3UTR_sum$Gene_name)], 0)) %>%
+          mutate(Darnell_4h_3UTR_sum_n90 = if_else(Gene %in% CLIP_4h_3UTR_sum$Gene_name, CLIP_4h_3UTR_sum$sum_3UTR_4h_n90[match(Gene, CLIP_4h_3UTR_sum$Gene_name)], 0)) -> Th1_hm
+
+summary(Th1_hm)
+```
+Range of 0-20 for CLIP and 5-16 for expression as for metabolism. Max Ribo z score is outside the 4.6 limit set for other heatmaps, but fine to use the same colour scale breaks for the main heatmap since any outliers will just be displayed with max.
+
+```{r}
+Th1_hm %>%
+  add_row(Gene ="dummy", Nascent_zscore = 0, Stability_zscore = 0, RNA_zscore =0, Ribo_zscore =0, Darnell_4h_3UTR_sum_n90 = 20, Darnell_72h_3UTR_sum_n90 =20, iCLIP_24h_3UTR_sum_n90 =20, RNA_Ctrl_expression = 5) %>%
+  add_row(Gene ="dummy2", Nascent_zscore = 0, Stability_zscore = 0, RNA_zscore =0, Ribo_zscore =0, Darnell_4h_3UTR_sum_n90 = 0, Darnell_72h_3UTR_sum_n90 =0, iCLIP_24h_3UTR_sum_n90 =0, RNA_Ctrl_expression = 16) -> Th1_hm
+```
+
+Separate out into z scores for main heatmap, annotations, and p values - convert these to stars depending on significance. 
+
+Symmetrical breaks for main colour scale will be the same as those used for TFs.
+
+For CLIP annotations - log transform values.
+
+```{r}
+Th1_hm %>%
+  select(1:5) %>%
+  column_to_rownames("Gene") ->
+    Th1_zscores
+
+
+Th1_hm %>%
+  mutate(Nascent_sig = case_when(
+    Nascent_padj < 0.05 ~ "***",
+    Nascent_pval < 0.05 ~ "**",
+    Nascent_pval < 0.1 ~ "*",
+    TRUE ~ ""
+  )) %>%
+  mutate(Stability_sig = case_when(
+    Stability_padj < 0.05 ~ "***",
+    Stability_pval < 0.05 ~ "**",
+    Stability_pval < 0.1 ~ "*",
+    TRUE ~ ""
+  )) %>%
+  mutate(RNA_sig = case_when(
+    RNA_padj < 0.05 ~ "***",
+    RNA_pval < 0.05 ~ "**",
+    RNA_pval < 0.1 ~ "*",
+    TRUE ~ ""
+  )) %>%
+  mutate(Ribo_sig = case_when(
+    Ribo_padj < 0.05 ~ "***",
+    Ribo_pval < 0.05 ~ "**",
+    Ribo_pval < 0.1 ~ "*",
+    TRUE ~ ""
+  )) %>%
+  select(Gene, ends_with("sig")) %>%
+  column_to_rownames("Gene") -> Th1_sig
+
+
+Th1_hm %>%
+  select(Gene, RNA_Ctrl_expression, ends_with("n90")) %>%
+  mutate_at(vars(ends_with("n90")), function(x) log2((10*x)+1)) %>%
+  column_to_rownames("Gene") -> Th1_annotations
+
+```
+
+
+Plot heatmap:
+
+```{r fig.height=4.5, fig.width=4.5}
+#pdf("Figure_panels/Fig7G_Th1hm.pdf", height = 4.5, width = 4.5)
+Th1_zscores %>%
+  pheatmap(cluster_rows = F,
+           cluster_cols = F,
+           breaks = sym_breaks, 
+           angle_col = 45, 
+           fontsize_row = 10,
+           color = c(colorRampPalette(colors = brewer.pal(11,"RdBu")[11:10])(100),colorRampPalette(colors = brewer.pal(11,"RdBu")[10:2])(200),colorRampPalette(colors = brewer.pal(11,"RdBu")[2:1])(100)), 
+           display_numbers = Th1_sig, 
+           annotation_row = Th1_annotations,
+           annotation_colors = list(
+             Darnell_72h_3UTR_sum_n90 = brewer.pal(9, "Greens"),
+             Darnell_4h_3UTR_sum_n90 = brewer.pal(9, "Greens"),
+             iCLIP_24h_3UTR_sum_n90 = brewer.pal(9, "Greens"),
+             RNA_Ctrl_expression = brewer.pal(9, "Purples")
+           ),
+           fontsize_number = 14,
+           annotation_legend = F)
+#dev.off()
+```
+
+Figure 7H-K: Influenza
+=========================
+
+There are 3 experiments for this. KC36 does not include TNF so can only plot IFNg and granzyme, for the others can include IFNg vs TNF and TNF MFI as well.
+
+```{r}
+read_tsv("Influenza/KC27_final.txt") %>%
+  mutate(Genotype = factor(sub("[0-9]", "", Sample), levels = c("WT","KO"))) -> influenza_KC27
+
+read_tsv("Influenza/KC36_final.txt") %>%
+  mutate(Genotype = factor(sub("[0-9]", "", Sample), levels = c("WT","K"), labels = c("WT","KO"))) -> influenza_KC36
+
+read_tsv("Influenza/KC45_final.txt") %>%
+  mutate(Genotype = factor(sub("[0-9]", "", Sample), levels = c("WT","K"), labels = c("WT","KO"))) -> influenza_KC45
+```
+
+IFN or TNF single positive
+--------------------------
+
+```{r fig.height=2.5, fig.width=2}
+influenza_KC27 %>%
+  ggplot(aes(x = Genotype, y = IFNg_total, shape = Genotype)) +
+    stat_summary(geom = "crossbar", fun = "mean", fun.min = "mean", fun.max = "mean", width=0.7, colour = "black") +
+    geom_jitter(height = 0, width=0.2, size = 2.5) +
+    scale_shape_manual(values = c(16, 1)) +
+    theme(legend.position = "none") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    coord_cartesian(ylim = c(0,15)) + 
+    labs(x = NULL, y = "IFNg+ percent")
+
+influenza_KC36 %>%
+  ggplot(aes(x = Genotype, y = IFNgpos, shape = Genotype)) +
+    stat_summary(geom = "crossbar", fun = "mean", fun.min = "mean", fun.max = "mean", width=0.7, colour = "black") +
+    geom_jitter(height = 0, width=0.2, size = 2.5) +
+    scale_shape_manual(values = c(16, 1)) +
+    theme(legend.position = "none") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    coord_cartesian(ylim = c(0,15)) + 
+    labs(x = NULL, y = "IFNg+ percent")
+
+influenza_KC45 %>%
+  ggplot(aes(x = Genotype, y = IFNg_total, shape = Genotype)) +
+    stat_summary(geom = "crossbar", fun = "mean", fun.min = "mean", fun.max = "mean", width=0.7, colour = "black") +
+    geom_jitter(height = 0, width=0.2, size = 2.5) +
+    scale_shape_manual(values = c(16, 1)) +
+    theme(legend.position = "none") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    coord_cartesian(ylim = c(0,15)) + 
+    labs(x = NULL, y = "IFNg+ percent")
+ggsave("Figure_panels/Fig7J_IFNpercent_KC45flu.pdf", useDingbats = F)
+
+
+influenza_KC27 %>%
+  ggplot(aes(x = Genotype, y = TNF_total, shape = Genotype)) +
+    stat_summary(geom = "crossbar", fun = "mean", fun.min = "mean", fun.max = "mean", width=0.7, colour = "black") +
+    geom_jitter(height = 0, width=0.2, size = 2.5) +
+    scale_shape_manual(values = c(16, 1)) +
+    theme(legend.position = "none") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    coord_cartesian(ylim = c(0,10)) + 
+    labs(x = NULL, y = "TNF+ percent")
+
+
+influenza_KC45 %>%
+  ggplot(aes(x = Genotype, y = TNF_total, shape = Genotype)) +
+    stat_summary(geom = "crossbar", fun = "mean", fun.min = "mean", fun.max = "mean", width=0.7, colour = "black") +
+    geom_jitter(height = 0, width=0.2, size = 2.5) +
+    scale_shape_manual(values = c(16, 1)) +
+    theme(legend.position = "none") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    coord_cartesian(ylim = c(0,10)) + 
+    labs(x = NULL, y = "TNF+ percent")
+```
+
+Pattern is always the same for IFNg+ (and TNF+) though numbers vary - best to show one as representative. All plots for manuscript figures coming from KC45
+
+T-tests for IFNg+ or TNF+
+
+```{r}
+t.test(IFNg_total ~ Genotype, influenza_KC27)
+t.test(IFNgpos ~ Genotype, influenza_KC36)
+t.test(IFNg_total ~ Genotype, influenza_KC45)
+
+t.test(TNF_total ~ Genotype, influenza_KC27)
+t.test(TNF_total ~ Genotype, influenza_KC45)
+```
+Significant in all but IFN in KC36 (almost there for that)
+
+
+IFN/TNF double positive
+---------------------------
+
+```{r fig.height=2.5, fig.width=2}
+influenza_KC27 %>%
+  ggplot(aes(x = Genotype, y = TNFposIFNgpos, shape = Genotype)) +
+    stat_summary(geom = "crossbar", fun = "mean", fun.min = "mean", fun.max = "mean", width=0.7, colour = "black") +
+    geom_jitter(height = 0, width=0.2, size = 2.5) +
+    scale_shape_manual(values = c(16, 1)) +
+    theme(legend.position = "none") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    coord_cartesian(ylim = c(0,8)) + 
+    labs(x = NULL, y = "TNF+IFNg+ percent")
+
+influenza_KC45 %>%
+  ggplot(aes(x = Genotype, y = TNFposIFNgpos, shape = Genotype)) +
+    stat_summary(geom = "crossbar", fun = "mean", fun.min = "mean", fun.max = "mean", width=0.7, colour = "black") +
+    geom_jitter(height = 0, width=0.2, size = 2.5) +
+    scale_shape_manual(values = c(16, 1)) +
+    theme(legend.position = "none") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    coord_cartesian(ylim = c(0,8)) + 
+    labs(x = NULL, y = "TNF+IFNg+ percent")
+ggsave("Figure_panels/Fig7K_IFNTNFpercent_KC45flu.pdf", useDingbats = F)
+
+```
+Pattern also the same for IFNg+TNF+ double positive
+
+T-tests:
+
+```{r}
+t.test(TNFposIFNgpos ~ Genotype, influenza_KC27)
+t.test(TNFposIFNgpos ~ Genotype, influenza_KC45)
+
+```
+
+Significant for both
+
+
+Granzyme B percentage
+---------------------
+
+```{r fig.height=2.5, fig.width=2}
+influenza_KC27 %>%
+  ggplot(aes(x = Genotype, y = GzmBpos, shape = Genotype)) +
+    stat_summary(geom = "crossbar", fun = "mean", fun.min = "mean", fun.max = "mean", width=0.7, colour = "black") +
+    geom_jitter(height = 0, width=0.2, size = 2.5) +
+    scale_shape_manual(values = c(16, 1)) +
+    theme(legend.position = "none") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    coord_cartesian(ylim = c(0,25)) + 
+    labs(x = NULL, y = "GzmB+ percent")
+
+influenza_KC36 %>%
+  ggplot(aes(x = Genotype, y = GzmBpos, shape = Genotype)) +
+    stat_summary(geom = "crossbar", fun = "mean", fun.min = "mean", fun.max = "mean", width=0.7, colour = "black") +
+    geom_jitter(height = 0, width=0.2, size = 2.5) +
+    scale_shape_manual(values = c(16, 1)) +
+    theme(legend.position = "none") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    coord_cartesian(ylim = c(0,25)) + 
+    labs(x = NULL, y = "GzmB+ percent")
+
+influenza_KC45 %>%
+  ggplot(aes(x = Genotype, y = GzmBpos, shape = Genotype)) +
+    stat_summary(geom = "crossbar", fun = "mean", fun.min = "mean", fun.max = "mean", width=0.7, colour = "black") +
+    geom_jitter(height = 0, width=0.2, size = 2.5) +
+    scale_shape_manual(values = c(16, 1)) +
+    theme(legend.position = "none") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    coord_cartesian(ylim = c(0,25)) + 
+    labs(x = NULL, y = "GzmB+ percent")
+ggsave("Figure_panels/Fig7H_GzmBpercent_KC45flu.pdf", useDingbats = F)
+```
+
+T-tests:
+
+```{r}
+t.test(GzmBpos ~ Genotype, influenza_KC27)
+t.test(GzmBpos ~ Genotype, influenza_KC36)
+t.test(GzmBpos ~ Genotype, influenza_KC45)
+
+```
+Significant for all
+
+
+Granzyme B MFI
+---------------
+
+
+```{r fig.height=2.5, fig.width=2}
+influenza_KC27 %>%
+  ggplot(aes(x = Genotype, y = GzmB_geomean, shape = Genotype)) +
+    stat_summary(geom = "crossbar", fun = "mean", fun.min = "mean", fun.max = "mean", width=0.7, colour = "black") +
+    geom_jitter(height = 0, width=0.2, size = 2.5) +
+    scale_shape_manual(values = c(16, 1)) +
+    theme(legend.position = "none") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    coord_cartesian(ylim = c(0,700)) + 
+    labs(x = NULL, y = "GzmB geoMFI")
+
+influenza_KC36 %>%
+  ggplot(aes(x = Genotype, y = GzmB_geomean, shape = Genotype)) +
+    stat_summary(geom = "crossbar", fun = "mean", fun.min = "mean", fun.max = "mean", width=0.7, colour = "black") +
+    geom_jitter(height = 0, width=0.2, size = 2.5) +
+    scale_shape_manual(values = c(16, 1)) +
+    theme(legend.position = "none") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    coord_cartesian(ylim = c(0,1200)) + 
+    labs(x = NULL, y = "GzmB geoMFI")
+
+influenza_KC45 %>%
+  ggplot(aes(x = Genotype, y = GzmB_geomean, shape = Genotype)) +
+    stat_summary(geom = "crossbar", fun = "mean", fun.min = "mean", fun.max = "mean", width=0.7, colour = "black") +
+    geom_jitter(height = 0, width=0.2, size = 2.5) +
+    scale_shape_manual(values = c(16, 1)) +
+    theme(legend.position = "none") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    coord_cartesian(ylim = c(0,1950)) + 
+    labs(x = NULL, y = "GzmB geoMFI")
+ggsave("Figure_panels/Fig7I_GzmBmfi_KC45flu.pdf", useDingbats = F)
+```
+In KC36 it does look like there's an increase, but this is not consistent in the other experiments.
+
+T-tests:
+
+```{r}
+t.test(GzmB_geomean ~ Genotype, influenza_KC27)
+t.test(GzmB_geomean ~ Genotype, influenza_KC36)
+t.test(GzmB_geomean ~ Genotype, influenza_KC45)
+
+```
+
+Significant for KC36 but nowhere near for the others - there may be a difference in some cases but it is not consistent. KC45 is appropriate to use as representative since it does not show a difference (although mean is slightly higher and one mouse is higher).
+
+
+
+Session info
+==============
+
+```{r}
+sessionInfo()
+
+```
