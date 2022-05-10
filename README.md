@@ -29,3 +29,8 @@ Code used for analysis in Matheson et al manuscript on the role of ZFP36/ZFP36L1
 v1.0 release DOI:
 
 [![DOI](https://zenodo.org/badge/489508294.svg)](https://zenodo.org/badge/latestdoi/489508294)
+<br>
+<br>v1.1 release:
+<br>Addition of stats for the effect of glutamine and aKG
+
+[![DOI](https://zenodo.org/badge/489508294.svg)](https://zenodo.org/badge/latestdoi/489508294)
