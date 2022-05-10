@@ -2558,27 +2558,48 @@ glutamine_titration_summary %>%
 ggsave("Figure_panels/Fig7C_glutamineTh1_GzmbMFI.pdf")
 ```
 
-Mann whitney tests
+Kruskal-wallis tests
 
 ```{r}
 glutamine_titration_summary %>%
   group_by(Glutamine_mM) %>%
-  wilcox_test(TbetIfng ~ Genotype) %>%
+  kruskal_test(TbetIfng ~ Genotype) %>%
   ungroup() %>%
   bind_rows({
     glutamine_titration_summary %>%
       group_by(Glutamine_mM) %>%
-      wilcox_test(EomesGzmbPoly ~ Genotype) %>%
+      kruskal_test(EomesGzmbPoly ~ Genotype) %>%
       ungroup()
   }) %>%
   bind_rows({
     glutamine_titration_summary %>%
       group_by(Glutamine_mM) %>%
-      wilcox_test(GzmbgMFIcons ~ Genotype) %>%
+      kruskal_test(GzmbgMFIcons ~ Genotype) %>%
       ungroup()
+  }) %>%
+  rename(Condition = Glutamine_mM) %>%
+  bind_rows({
+    glutamine_titration_summary %>%
+  group_by(Genotype) %>%
+  kruskal_test(TbetIfng ~ Glutamine_mM) %>%
+  ungroup() %>%
+  bind_rows({
+    glutamine_titration_summary %>%
+      group_by(Genotype) %>%
+      kruskal_test(EomesGzmbPoly ~ Glutamine_mM) %>%
+      ungroup()
+  }) %>%
+  bind_rows({
+    glutamine_titration_summary %>%
+      group_by(Genotype) %>%
+      kruskal_test(GzmbgMFIcons ~ Glutamine_mM) %>%
+      ungroup()
+  }) %>%
+      rename(Condition = Genotype)
   }) %>%
   mutate(padj = p.adjust(p, "fdr"))
 ```
+
 
 Calculate averages/differences/fold changes
 --------------------------------------------
@@ -2645,21 +2666,38 @@ ggsave("Figure_panels/Fig7E_aKGTh1_EomesGzmb.pdf")
 
 
 ```
-Mann-whitney tests
+
+Kruskal-wallis tests
 
 ```{r}
 aKG_titration_summary %>%
   group_by(aKG_mM) %>%
-  wilcox_test(TbetIfng ~ Genotype) %>%
+  kruskal_test(TbetIfng ~ Genotype) %>%
   ungroup() %>%
   bind_rows({
     aKG_titration_summary %>%
       group_by(aKG_mM) %>%
-      wilcox_test(EomesGzmbPoly ~ Genotype) %>%
+      kruskal_test(EomesGzmbPoly ~ Genotype) %>%
       ungroup()
+  }) %>%
+  rename(Condition = aKG_mM) %>%
+  bind_rows({
+    aKG_titration_summary %>%
+  group_by(Genotype) %>%
+  kruskal_test(TbetIfng ~ aKG_mM) %>%
+  ungroup() %>%
+  bind_rows({
+    aKG_titration_summary %>%
+      group_by(Genotype) %>%
+      kruskal_test(EomesGzmbPoly ~ aKG_mM) %>%
+      ungroup()
+  }) %>%
+      rename(Condition = Genotype)
   }) %>%
   mutate(padj = p.adjust(p, "fdr"))
 ```
+
+
 
 Figure 7F - transcriptomic read counts
 ======================================
