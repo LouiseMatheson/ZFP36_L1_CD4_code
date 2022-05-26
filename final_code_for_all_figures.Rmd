@@ -722,9 +722,9 @@ up_all_L2FC$clusterColCor <- as.character(factor(up_all_L2FC$clustersCor, levels
 
 up_all_L2FC_hm <- up_all_L2FC[,3:5]
 
-#pdf("Figure_panels/Fig2A_clustered_heatmap.pdf", height=6, width=10)
+pdf("Figure_panels/Fig2A_clustered_heatmap.pdf", height=6, width=10)
 heatmap.2(t(up_all_L2FC_hm[,c(2,3,1)]), Colv = as.dendrogram(up_all_hcCor), Rowv = F, col = c(colorRampPalette(colors = brewer.pal(11,"RdBu")[11:10])(100),colorRampPalette(colors = brewer.pal(11,"RdBu")[10:2])(200),colorRampPalette(colors = brewer.pal(11,"RdBu")[2:1])(100)), density.info = "none", cexRow = 0.8, trace = "none", symkey = T, symbreaks = T, ColSideColors = up_all_L2FC$clusterColCor, srtCol = 45)
-#dev.off()
+dev.off()
 ```
 
 Order of clusters in heatmap is:
@@ -1442,28 +1442,33 @@ phyloP_selected %>%
 
 
 For function, optionally can provide zoom_min and/or zoom_max if you want to display only a portion of the gene (eg only the 3' end).
-Can also set displayTATT to TRUE if you want to show locations of TATT motifs
+Can also set displayTATT to TRUE if you want to show locations of TATT motifs (if >1 transcript isoform listed, will only plot these on the first)
 
 
 ```{r}
 plot_CLIP_profile = function(Transcript, CLIPdata = CLIP_72h_all_xl_sites, zoom_min = NA, zoom_max = NA, displayTATT = F, consPlot = F, consData = phyloP_selected, max_cons = max(abs(consData$score_smooth))) {
   GRCm38_90_gtf[GRCm38_90_gtf$transcript_name %in% Transcript & GRCm38_90_gtf$type %in% c("CDS", "stop_codon", "five_prime_utr", "three_prime_utr")] %>%
     as_tibble() %>%
-    select(seqnames, start, end, strand, type) %>%
+    select(seqnames, start, end, strand, type, transcript_name) %>%
     mutate(type = if_else(type %in% c("CDS", "stop_codon"), "CDS", "UTR")) %>%
     mutate(exon_start = if_else(strand == "+", start - 0.5, end + 0.5)) %>%
-    mutate(exon_end = if_else(strand == "+", end + 0.5, start - 0.5)) -> transcript_coord
+    mutate(exon_end = if_else(strand == "+", end + 0.5, start - 0.5)) %>%
+    group_by(transcript_name) %>%
+    mutate(transcript_offset = which(unique(transcript_name) == Transcript)) %>%
+    ungroup() -> transcript_coord
   if(transcript_coord$strand[1] == "+") {
     transcript_coord %>%
-      arrange(exon_start) -> transcript_coord
+      arrange(transcript_offset, exon_start) -> transcript_coord
   } else {
     transcript_coord %>%
-      arrange(desc(exon_start)) -> transcript_coord
+      arrange(transcript_offset, desc(exon_start)) -> transcript_coord
   }
   transcript_coord %>%
+    group_by(transcript_offset) %>%
     mutate(intron_start = exon_end, intron_end = lead(exon_start)) %>%
     mutate(intron_start = if_else(intron_start == intron_end, NA_real_, intron_start)) %>%
-    mutate(intron_end = if_else(is.na(intron_start), NA_real_, intron_end)) -> transcript_coord
+    mutate(intron_end = if_else(is.na(intron_start), NA_real_, intron_end)) %>%
+    ungroup() -> transcript_coord
   
   if(is.na(zoom_min)) {
     zoom_min <- min(transcript_coord$start)
@@ -1479,16 +1484,16 @@ plot_CLIP_profile = function(Transcript, CLIPdata = CLIP_72h_all_xl_sites, zoom_
   
   ggplot() +
     geom_rect(data = CLIPdata, aes(xmin = start-0.5, xmax = start+0.5, ymin = 0, ymax = score_norm), fill = "royalblue4", colour = "royalblue4") + 
-    geom_rect(data = transcript_coord, aes(xmin = exon_start, xmax = exon_end, fill = type, ymin = -0.4, ymax = -0.1), colour = "royalblue4") + 
+    geom_rect(data = transcript_coord, aes(xmin = exon_start, xmax = exon_end, fill = type, ymin = (-transcript_offset/2)+0.1, ymax = (-transcript_offset/2)+0.4), colour = "royalblue4") + 
     scale_fill_manual(name = NULL, values = c("royalblue4","transparent")) + 
-    geom_segment(data = transcript_coord, aes(x = intron_start, xend = intron_end, y = -0.15, yend = -0.25), colour  = "royalblue4") + 
-    geom_segment(data = transcript_coord, aes(x = intron_start, xend = intron_end, y = -0.35, yend = -0.25), colour  = "royalblue4") + 
+    geom_segment(data = transcript_coord, aes(x = intron_start, xend = intron_end, y = (-transcript_offset/2)+0.15, yend = (-transcript_offset/2)+0.25), colour  = "royalblue4") + 
+    geom_segment(data = transcript_coord, aes(x = intron_start, xend = intron_end, y = (-transcript_offset/2)+0.35, yend = (-transcript_offset/2)+0.25), colour  = "royalblue4") + 
     annotate("text",x = zoom_min, y = 1, label = max(CLIPdata$score), vjust = 0.5, hjust = 0)+
     geom_hline(yintercept = 0) +
     theme(axis.line = element_blank()) +
     coord_cartesian(xlim = c(zoom_min-1, zoom_max+1)) +
     scale_x_continuous(expand = c(0,0)) +
-    labs(x = paste("Chromosome", transcript_coord$seqnames[1]), y = "CLIP crosslinks", title = Transcript) -> CLIPplot
+    labs(x = paste("Chromosome", transcript_coord$seqnames[1]), y = "CLIP crosslinks", title = paste(Transcript, collapse = "; ")) -> CLIPplot
   
   if(displayTATT == T) {
     getSeq(BSgenome.Mmusculus.UCSC.mm10, paste0("chr", transcript_coord$seqnames[1]), zoom_min, zoom_max, strand = transcript_coord$strand[1], as.character = T) -> transcript_seq
@@ -1506,9 +1511,9 @@ plot_CLIP_profile = function(Transcript, CLIPdata = CLIP_72h_all_xl_sites, zoom_
     consData %>%
       filter(chromosome == paste0("chr", transcript_coord$seqnames[1])) %>% # NB this won't work for MT but I don't need it to for my purposes. 
       filter(start >= zoom_min & start <= zoom_max) %>%
-      mutate(score_smooth = (score_smooth/(2*max_cons))-1) -> consData
+      mutate(score_smooth = (score_smooth/(2*max_cons))-(max(transcript_coord$transcript_offset)/2+0.5)) -> consData
     CLIPplot +
-      geom_hline(yintercept = -1) +
+      geom_hline(yintercept = -(max(transcript_coord$transcript_offset)/2+0.5)) +
       geom_line(data = consData, aes(x = start, y = score_smooth)) -> CLIPplot
   }
   
@@ -1689,9 +1694,9 @@ Figure 5A-C
 ### Gls
 
 ```{r fig.height=2, fig.width=5}
-plot_CLIP_profile("Gls-202")
+plot_CLIP_profile(c("Gls-202", "Gls-204"))
 ggsave("Figure_panels/Fig5A_GlsCLIP_complete.pdf")
-plot_CLIP_profile("Gls-202", zoom_max = 52188200, displayTATT = T, consPlot = T)
+plot_CLIP_profile(c("Gls-202"), zoom_max = 52188200, displayTATT = T, consPlot = T)
 ggsave("Figure_panels/Fig5A_GlsCLIP_3UTR.pdf")
 ```
 
@@ -1845,7 +1850,7 @@ Plot heatmap:
 ```{r fig.height=15, fig.width=4.5}
 sym_breaks <- seq(-4.6, 4.6, length.out = 401)
 
-#pdf("Figure_panels/Fig3A_4A_RNA_hm.pdf", height = 15, width = 4.5)
+pdf("Figure_panels/Fig3A_4A_RNA_hm.pdf", height = 15, width = 4.5)
 Metabolism_RNA_zscores %>%
   pheatmap(cluster_rows = F,
            cluster_cols = F,
@@ -1864,7 +1869,7 @@ Metabolism_RNA_zscores %>%
            fontsize_number = 14,
            annotation_legend = F,
            gaps_row = c(21, 28, 31, 41, 47, 69, 78, 83, 88, 92))
-#dev.off()
+dev.off()
 ```
 
 
@@ -1906,7 +1911,7 @@ all_metabolomics_LCMS %>%
 Plot data:
 
 ```{r fig.height=8, fig.width=5.5}
-#pdf("Figure_panels/Fig6A_met_hm.pdf", height=8, width =5.5, useDingbats = F)
+pdf("Figure_panels/Fig6A_met_hm.pdf", height=8, width =5.5, useDingbats = F)
 all_metabolites_total_scaled %>%
   pheatmap(cluster_rows = F,
            cluster_cols = F,
@@ -1918,7 +1923,7 @@ all_metabolites_total_scaled %>%
              Ctrl_mean = brewer.pal(9,"Blues")
              ),
            gaps_row = c(9,14,29,39, 49))
-#dev.off()
+dev.off()
 ```
 
 Calculate fold change (non-log transformed) and export for supplementary table
@@ -2299,9 +2304,9 @@ plot_abundance_with_labelled("Suc", title = "Succinate") -> pGlcSuc
 
 ggarrange(pGlcPyr, pGlcLac, pGlcSer, pGlcGlu, pGlcAkg, pGlcMal, pGlcFum, pGlcAsp, pGlcCit, pGlcSuc, nrow = 3)
 
-#pdf("Figure_panels/Fig6B_glucLab.pdf", height = 3, width = 5.5)
+pdf("Figure_panels/Fig6B_glucLab.pdf", height = 3, width = 5.5)
 ggarrange(pGlcPyr, pGlcLac, pGlcSer, nrow = 1)
-#dev.off()
+dev.off()
 ```
 
 
@@ -2360,9 +2365,9 @@ plot_abundance_with_labelled("Asp", ion_data = Glutamine_tracing_ion_counts, lab
 plot_abundance_with_labelled("Cit", ion_data = Glutamine_tracing_ion_counts, labelled_data = Glutamine_tracing_labelled_ion_counts, colour = "dodgerblue3", title = "Citrate") -> pGluCit
 plot_abundance_with_labelled("Suc", ion_data = Glutamine_tracing_ion_counts, labelled_data = Glutamine_tracing_labelled_ion_counts, colour = "dodgerblue3", title = "Succinate") -> pGluSuc
 
-#pdf("Figure_panels/Fig6E_glucglut_tracing.pdf", height = 10, width = 8)
+pdf("Figure_panels/Fig6E_glucglut_tracing.pdf", height = 10, width = 8)
 ggarrange(pGlcGlu, pGluGlu, pGlcAkg, pGluAkg, pGlcFum, pGluFum, pGlcMal, pGluMal, pGlcAsp, pGluAsp, pGlcCit, pGluCit, pGlcSuc, pGluSuc, ncol = 4)
-#dev.off()
+dev.off()
 ```
 
 Figure 6F - aKG:succinate ratios
@@ -2846,7 +2851,7 @@ Th1_hm %>%
 Plot heatmap:
 
 ```{r fig.height=4.5, fig.width=4.5}
-#pdf("Figure_panels/Fig7G_Th1hm.pdf", height = 4.5, width = 4.5)
+pdf("Figure_panels/Fig7G_Th1hm.pdf", height = 4.5, width = 4.5)
 Th1_zscores %>%
   pheatmap(cluster_rows = F,
            cluster_cols = F,
@@ -2864,7 +2869,7 @@ Th1_zscores %>%
            ),
            fontsize_number = 14,
            annotation_legend = F)
-#dev.off()
+dev.off()
 ```
 
 Figure 7H-K: Influenza
