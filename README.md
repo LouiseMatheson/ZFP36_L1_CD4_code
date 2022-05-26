@@ -26,6 +26,7 @@ Code used for analysis in Matheson et al manuscript on the role of ZFP36/ZFP36L1
 <br>All analysis was performed using R v4.1.2 and packages as shown in the sessionInfo() section at the end of the R notebook. 
 
 
-v1.0 release DOI:
+Latest release (v1.1):
 
 [![DOI](https://zenodo.org/badge/489508294.svg)](https://zenodo.org/badge/latestdoi/489508294)
+
