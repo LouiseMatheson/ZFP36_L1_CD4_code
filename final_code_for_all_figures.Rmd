@@ -130,8 +130,8 @@ ggsave("Figure_panels/FigS1B_ZFPqPCR.pdf", useDingbats = F)
 ```
 
 
-Figure 1A-D; MA plots
-=====================
+Figure 1A-D, S1C-E; MA plots
+============================
 
 Read in counts for all
 ----------------------
@@ -197,6 +197,30 @@ read_tsv("Raw_counts_Seqmonk/Ribo_cds_raw_counts.txt", col_types = cols(Chromoso
 ```
 Warnings for RiboSeq are because some genes with duplicate names don't have a CDS so the subsets are empty - but equally there are no values to replace so this does not matter. 
 
+
+Single KO data:
+(also read in and rename columns to correspond to GEO; export with just gene names and counts)
+
+```{r}
+read_tsv("Raw_counts_Seqmonk/RNA_sKO_raw_counts.txt", col_types = cols(Chromosome = col_character())) %>%
+  rename_with(~ gsub(" ", "_", .x)) %>%
+  RNA_seqmonk_to_corrected_counts() -> RNA_sKO_raw_counts_corrected
+
+read_tsv("Raw_counts_Seqmonk/RNA_sKO_raw_counts.txt", col_types = cols(Chromosome = col_character())) %>%
+  select(Probe, ends_with("bam")) %>%
+  rename_with(~ sub("_24h.*", "", .x)) %>%
+  rename_with(~ paste0("mRNA_", .x)) %>%
+  rename_with(~ sub("TTP", "A", .x)) %>%
+  rename_with(~ sub("WT", "Ctrl_", .x)) %>%
+  rename_with(~ sub("A_KO", "A_Zfp36_sKO_", .x)) %>%
+  rename_with(~ sub("B_KO", "B_Zfp36l1_sKO_", .x)) %>%
+  rename(Gene = mRNA_Probe) %>%
+  rename(mRNA_A_Ctrl_2 = mRNA_A_Ctrl_3) %>%
+  rename(mRNA_B_Zfp36l1_sKO_2 = mRNA_B_Zfp36l1_sKO_3) %>%
+  select(Gene, contains("A_Ctr"), contains("A_Z"), contains("B_Ctr"), contains("B_Z")) %>%
+  write_tsv("mRNA_sKO_raw_counts.txt")
+```
+
 Simplify column names - in the case of nascent and total RNA I have tables to read in which define which sample is which since the names are not descriptive. 
 
 ```{r}
@@ -211,6 +235,9 @@ read_tsv("Raw_counts_Seqmonk/Nascent_samples.txt") %>%
 colnames(raw_counts_nascent_corrected)[match(Nascent_samples$sample.id,gsub("-", ".", colnames(raw_counts_nascent_corrected)))] <- Nascent_samples$sample_name
 
 colnames(Riboseq_raw_counts_corrected) <- sub("lane._(RF_...)_[ACGT].*","\\1", colnames(Riboseq_raw_counts_corrected))
+
+RNA_sKO_raw_counts_corrected %>%
+  rename_with(~ sub("_24h.*", "", .x)) -> RNA_sKO_raw_counts_corrected
 
 ```
 
@@ -229,8 +256,12 @@ summary(rownames(raw_counts_nascent_corrected) %in% rownames(Riboseq_raw_counts_
 #   Mode   FALSE    TRUE 
 #logical   11471   21985 
 
+
+summary(rownames(RNA_sKO_raw_counts_corrected) %in% rownames(RNA_raw_counts_corrected))
+#   Mode    TRUE 
+#logical   33456
 ```
-Nascent and total RNA have exactly the same genes represented (as would be expected since both based on mRNA annotations). 
+Nascent and total RNA (sKO and dKO) have exactly the same genes represented (as would be expected since both based on mRNA annotations). 
 
 Limit nascent and total RNA to only genes present in Riboseq
 Limit Riboseq to only genes present in total RNAseq. 
@@ -241,11 +272,12 @@ RNA_raw_counts_complete <- RNA_raw_counts_corrected[rownames(RNA_raw_counts_corr
 Nascent_raw_counts_complete <- raw_counts_nascent_corrected[rownames(raw_counts_nascent_corrected) %in% rownames(Riboseq_raw_counts_corrected),]
 Ribo_raw_counts_complete <- Riboseq_raw_counts_corrected[rownames(Riboseq_raw_counts_corrected) %in% rownames(RNA_raw_counts_corrected),]
 
+RNA_sKO_raw_counts_complete <- RNA_sKO_raw_counts_corrected[rownames(RNA_sKO_raw_counts_corrected) %in% rownames(Riboseq_raw_counts_corrected),]
 ```
 
 
-DESeq2 analysis of total RNA-seq
----------------------------------
+DESeq2 analysis of total RNA-seq (dKO)
+--------------------------------------
 
 Create coldata and run DESeq2 for total RNA-seq
 
@@ -274,7 +306,7 @@ norm_counts_RNA %>%
   mutate(Ctrl_mean = rowMeans(log2(select(., contains("Ctrl"))+1))) -> norm_counts_RNA
 ```
 
-### Table S1 - mRNA DE genes
+### Table S2 - mRNA DE genes
 
 Export significantly altered genes for supplementary table (increased and decreased separately):
 
@@ -284,14 +316,164 @@ res_RNA %>%
   filter(padj < 0.05) %>%
   filter(log2FoldChange > 0) %>%
   arrange(padj) %>%
-  write_tsv("Supplementary_tables/TableS1_RNAincreased.txt")
+  write_tsv("Supplementary_tables/TableS2_RNAincreased.txt")
 
 res_RNA %>% 
   filter(baseMean > 10) %>%
   filter(padj < 0.05) %>%
   filter(log2FoldChange < 0) %>%
   arrange(padj) %>%
-  write_tsv("Supplementary_tables/TableS1_RNAdecreased.txt")
+  write_tsv("Supplementary_tables/TableS2_RNAdecreased.txt")
+```
+
+
+
+DESeq2 analysis of sKO RNA-seq 
+--------------------------------------
+
+Create coldata and run DESeq2 for total RNA-seq in sKO
+
+Extract normalised counts, and output from LFCshrink for KO vs Ctrl comparison in TTP and Tis11b sKO, with normal LFC shrinkage.
+
+```{r}
+RNA_sKO_raw_counts_complete %>%
+  select(starts_with("TTP")) -> TTP_sKO_raw_counts
+
+RNA_sKO_raw_counts_complete %>%
+  select(starts_with("B")) -> Tis11b_sKO_raw_counts
+
+tibble(sample = colnames(TTP_sKO_raw_counts)) %>%
+  mutate(Genotype = if_else(grepl("WT", sample), "Ctrl", "KO")) %>%
+  column_to_rownames("sample") -> coldata_TTP_sKO
+tibble(sample = colnames(Tis11b_sKO_raw_counts)) %>%
+  mutate(Genotype = if_else(grepl("WT", sample), "Ctrl", "KO")) %>%
+  column_to_rownames("sample") -> coldata_Tis11b_sKO
+
+TTP_sKO_raw_counts %>%
+  DESeqDataSetFromMatrix(coldata_TTP_sKO, design = ~Genotype) %>%
+  DESeq() -> dds_TTP_sKO
+Tis11b_sKO_raw_counts %>%
+  DESeqDataSetFromMatrix(coldata_Tis11b_sKO, design = ~Genotype) %>%
+  DESeq() -> dds_Tis11b_sKO
+
+counts(dds_TTP_sKO, normalized = T) %>%
+  as_tibble(rownames = "Gene") -> norm_counts_TTP_sKO
+dds_TTP_sKO %>%
+  lfcShrink(coef = 2, type = "normal") %>%
+  as_tibble(rownames = "Gene") -> res_TTP_sKO
+
+counts(dds_Tis11b_sKO, normalized = T) %>%
+  as_tibble(rownames = "Gene") -> norm_counts_Tis11b_sKO
+dds_Tis11b_sKO %>%
+  lfcShrink(coef = 2, type = "normal") %>%
+  as_tibble(rownames = "Gene") -> res_Tis11b_sKO
+
+```
+
+
+Comparison between sKO and dKO
+-------------------------------
+
+These datasets were generated independently, with separate controls for the two sKO and dKO experiments - they can't be integrated and eg normalised together as they are not sufficiently comparable. When DESeq2 is run independently, the log2 fold change shrinkage will be based on separate modelling, so the L2FC cannot really be compared between them. 
+
+To try and get around that, I will use an adapted version of the intensityDifference function (see intensityDifference.R). Originally by Simon Andrews (https://github.com/s-andrews/intensitydiff), version used here is modified to allow 'averages' and 'differences' to be provided directly, rather than calculated from separate data for Ctrl and KO, and also for lists of sets of averages/differences to be provided, and then modelled together (so that the potentially bigger L2FC in the dKO is not normalised away in the z-score calculation). 
+
+It calculates z-scores for the differences based on the local standard deviation of the expression levels, since the amount of noise decreases as expression increases. Ie, low expressed genes are penalised more.
+
+In this case, we want to start from the raw L2FC values (not already shrunken by lfcShrink) as the differences, and the baseMean as the averages.
+
+```{r}
+source("intensityDifference.R")
+
+results(dds_RNA) %>%
+  as_tibble(rownames = "Gene") %>%
+  filter(baseMean > 10) %>%
+  filter(!is.na(log2FoldChange)) -> l2fc_raw_dKO
+results(dds_TTP_sKO) %>%
+  as_tibble(rownames = "Gene") %>%
+  filter(baseMean > 10) %>%
+  filter(!is.na(log2FoldChange)) -> l2fc_raw_TTP_sKO
+results(dds_Tis11b_sKO) %>%
+  as_tibble(rownames = "Gene") %>%
+  filter(baseMean > 10) %>%
+  filter(!is.na(log2FoldChange)) -> l2fc_raw_Tis11b_sKO
+
+
+sKO_dKO_intensity_difference <- intensity.difference(averages = list(l2fc_raw_TTP_sKO$baseMean, l2fc_raw_Tis11b_sKO$baseMean, l2fc_raw_dKO$baseMean), differences = list(l2fc_raw_TTP_sKO$log2FoldChange, l2fc_raw_Tis11b_sKO$log2FoldChange, l2fc_raw_dKO$log2FoldChange))
+```
+
+```{r}
+TTP_sKO_intensity_diff <- sKO_dKO_intensity_difference[[1]]
+Tis11b_sKO_intensity_diff <- sKO_dKO_intensity_difference[[2]]
+dKO_intensity_diff <- sKO_dKO_intensity_difference[[3]]
+
+TTP_sKO_intensity_diff$Gene <- l2fc_raw_TTP_sKO$Gene
+Tis11b_sKO_intensity_diff$Gene <- l2fc_raw_Tis11b_sKO$Gene
+dKO_intensity_diff$Gene <- l2fc_raw_dKO$Gene
+
+TTP_sKO_intensity_diff$deseq_pval <- l2fc_raw_TTP_sKO$pvalue
+Tis11b_sKO_intensity_diff$deseq_pval <- l2fc_raw_Tis11b_sKO$pvalue
+dKO_intensity_diff$deseq_pval <- l2fc_raw_dKO$pvalue
+
+TTP_sKO_intensity_diff$deseq_padj <- l2fc_raw_TTP_sKO$padj
+Tis11b_sKO_intensity_diff$deseq_padj <- l2fc_raw_Tis11b_sKO$padj
+dKO_intensity_diff$deseq_padj <- l2fc_raw_dKO$padj
+
+```
+
+
+```{r fig.height=3.5, fig.width=6}
+TTP_sKO_intensity_diff %>%
+  ggplot(aes(x = average.intensity, y = z.score)) +
+    geom_point(aes(colour = deseq_padj < 0.05)) + 
+    scale_x_log10(breaks =c(10,100,1000,10000,100000)) +
+    scale_colour_manual(values = c("grey50","royalblue3")) +
+    coord_cartesian(xlim = c(10,250000), ylim= c(-17,17)) +
+    geom_text(data = filter(TTP_sKO_intensity_diff, Gene == "Zfp36"), aes(label = Gene), hjust = 0, nudge_x = 0.1) +
+    labs(title = "Zfp36 sKO", x = "Normalised read counts", y = "Z-score (KO/Ctrl)") +
+    annotate("text", x = 100000, y = c(-10,10), label = c(paste(nrow(filter(TTP_sKO_intensity_diff, deseq_padj < 0.05 & z.score < 0)), "genes decreased"), paste(nrow(filter(TTP_sKO_intensity_diff, deseq_padj < 0.05 & z.score > 0)), "genes increased")), hjust = 1)
+ggsave("Figure_panels/FigS1C_Zfp36_zscore.pdf")
+
+Tis11b_sKO_intensity_diff %>%
+  ggplot(aes(x = average.intensity, y = z.score)) +
+    geom_point(aes(colour = deseq_padj < 0.05)) + 
+    scale_x_log10(breaks =c(10,100,1000,10000,100000)) +
+    scale_colour_manual(values = c("grey50","royalblue3")) +
+    coord_cartesian(xlim = c(10,250000), ylim= c(-17,17)) +
+    geom_text(data = filter(Tis11b_sKO_intensity_diff, Gene == "Zfp36l1"), aes(label = Gene), hjust = 0, nudge_x = 0.1) +
+    labs(title = "Zfp36l1 sKO", x = "Normalised read counts", y = "Z-score (KO/Ctrl)") +
+    annotate("text", x = 100000, y = c(-10,10), label = c(paste(nrow(filter(Tis11b_sKO_intensity_diff, deseq_padj < 0.05 & z.score < 0)), "genes decreased"), paste(nrow(filter(Tis11b_sKO_intensity_diff, deseq_padj < 0.05 & z.score > 0)), "genes increased")), hjust = 1)
+ggsave("Figure_panels/FigS1D_Zfp36l1_zscore.pdf")
+
+
+dKO_intensity_diff %>%
+  ggplot(aes(x = average.intensity, y = z.score)) +
+    geom_point(aes(colour = deseq_padj < 0.05)) + 
+    scale_x_log10(breaks =c(10,100,1000,10000,100000)) +
+    scale_colour_manual(values = c("grey50","royalblue3")) +
+    coord_cartesian(xlim = c(10,250000), ylim= c(-17,17)) +
+    geom_text(data = filter(dKO_intensity_diff, Gene %in% c("Zfp36", "Zfp36l1")), aes(label = Gene), hjust = 0, nudge_x = 0.1) +
+    labs(title = "Zfp36/Zfp36l1 dKO", x = "Normalised read counts", y = "Z-score (KO/Ctrl)") +
+    annotate("text", x = 100000, y = c(-10,10), label = c(paste(nrow(filter(dKO_intensity_diff, deseq_padj < 0.05 & z.score < 0)), "genes decreased"), paste(nrow(filter(dKO_intensity_diff, deseq_padj < 0.05 & z.score > 0)), "genes increased")), hjust = 1)
+ggsave("Figure_panels/FigS1E_dKO_zscore.pdf")
+
+```
+
+### Table S1 - z-scores for single vs double KO comparison
+
+Combine these into a single table, and show z-scores and DESeq2-derived p values/padj for genes that have padj < 0.05 for at least one comparison
+
+```{r}
+TTP_sKO_intensity_diff %>%
+  left_join(Tis11b_sKO_intensity_diff, by = "Gene", suffix = c("_TTP", "_Tis11b")) %>%
+  left_join(rename_with(dKO_intensity_diff, ~ paste0(.x, "_dKO")), by = c("Gene" = "Gene_dKO")) %>%
+  select(Gene, starts_with("z.score"), starts_with("deseq")) -> sdKO_zscores_pvals
+
+sdKO_zscores_pvals %>%
+  select(Gene, contains("TTP"), contains("Tis"), contains("dKO")) %>%
+  filter(if_any(contains("padj"), ~ 0.05 > .x)) %>%
+  arrange(deseq_padj_dKO) %>%
+  write_tsv("Supplementary_tables/TableS1_sdKO_zscores.txt")
 ```
 
 
@@ -333,7 +515,7 @@ dds_4sU %>%
 
 ```
 
-### Table S2 - newly synthesised DE genes
+### Table S3 - newly synthesised DE genes
 
 Export significantly altered for supplemetary table - using padj < 0.1 for some analyses so include all of these.
 
@@ -343,14 +525,14 @@ res_4sU %>%
   filter(padj < 0.1) %>%
   filter(log2FoldChange > 0) %>%
   arrange(padj) %>%
-  write_tsv("Supplementary_tables/TableS2_4sUincreased.txt")
+  write_tsv("Supplementary_tables/TableS3_4sUincreased.txt")
 
 res_4sU %>% 
   filter(baseMean > 10) %>%
   filter(padj < 0.1) %>%
   filter(log2FoldChange < 0) %>%
   arrange(padj) %>%
-  write_tsv("Supplementary_tables/TableS2_4sUdecreased.txt")
+  write_tsv("Supplementary_tables/TableS3_4sUdecreased.txt")
 ```
 
 
@@ -441,16 +623,16 @@ To identify statistically significant differences between KO and Ctrl, will use 
 
 It calculates z-scores for the differences based on the local standard deviation of the expression levels, since the amount of noise decreases as expression increases. Ie, low expressed genes are penalised more. In this case, we need to provide the averages and differences separately, because the averages are average stability, whilst the local standard deviation should be based on expression (since things with similar stability are not necessarily of similar expression level, and we wouldn't expect any particular correlation between stability and noise). For the 'averages', I will use the mean normalised read counts across nascent (columns 2:5 in norm_counts_all_4sU) and total (columns 10:13 of norm_counts_all_4sU). For differences I will use the mean standardised stability shift calculated above.
 
-```{r}
-source("intensityDifference.R")
+Also used above for sKO vs dKO comparison
 
+```{r}
 Stability_differences$mean_total4sU <- rowMeans(norm_counts_all_4sU[match(Stability_differences$Gene, norm_counts_all_4sU$Gene), c(2:5, 10:13)])
 
 Stability_differences <- cbind(Stability_differences, intensity.difference(averages = Stability_differences$mean_total4sU, differences = Stability_differences$Stability_shift))
 
 ```
 
-### Table S3 - genes with altered stability
+### Table S4 - genes with altered stability
 
 Export genes with absolute z-score > 2 for supplementary table
 
@@ -460,14 +642,14 @@ Stability_differences %>%
   filter(z.score > 2) %>%
   arrange(desc(z.score)) %>%
   select(Gene, mean_total4sU, Stability_shift, local.sd, p.value, fdr.value, z.score) %>%
-  write_tsv("Supplementary_tables/TableS3_stabincreased.txt")
+  write_tsv("Supplementary_tables/TableS4_stabincreased.txt")
 
 Stability_differences %>% 
   filter(average.intensity > 10) %>%
   filter(z.score < -2) %>%
   arrange(z.score) %>%
   select(Gene, mean_total4sU, Stability_shift, local.sd, p.value, fdr.value, z.score) %>%
-  write_tsv("Supplementary_tables/TableS3_stabdecreased.txt")
+  write_tsv("Supplementary_tables/TableS4_stabdecreased.txt")
 ```
 
 Ribo-seq
@@ -489,7 +671,7 @@ lfcShrink(dds_Ribo, coef = 3, type = "normal") %>%
 
 ```
 
-### Table S4 - Riboseq DE genes
+### Table S5 - Riboseq DE genes
 
 Export signficant genes for supplementary table
 
@@ -499,14 +681,14 @@ res_Ribo %>%
   filter(padj < 0.05) %>%
   filter(log2FoldChange > 0) %>%
   arrange(padj) %>%
-  write_tsv("Supplementary_tables/TableS4_Riboincreased.txt")
+  write_tsv("Supplementary_tables/TableS5_Riboincreased.txt")
 
 res_Ribo %>% 
   filter(baseMean > 10) %>%
   filter(padj < 0.05) %>%
   filter(log2FoldChange < 0) %>%
   arrange(padj) %>%
-  write_tsv("Supplementary_tables/TableS4_Ribodecreased.txt")
+  write_tsv("Supplementary_tables/TableS5_Ribodecreased.txt")
 ```
 
 Generate plots
@@ -722,9 +904,9 @@ up_all_L2FC$clusterColCor <- as.character(factor(up_all_L2FC$clustersCor, levels
 
 up_all_L2FC_hm <- up_all_L2FC[,3:5]
 
-pdf("Figure_panels/Fig2A_clustered_heatmap.pdf", height=6, width=10)
+#pdf("Figure_panels/Fig2A_clustered_heatmap.pdf", height=6, width=10)
 heatmap.2(t(up_all_L2FC_hm[,c(2,3,1)]), Colv = as.dendrogram(up_all_hcCor), Rowv = F, col = c(colorRampPalette(colors = brewer.pal(11,"RdBu")[11:10])(100),colorRampPalette(colors = brewer.pal(11,"RdBu")[10:2])(200),colorRampPalette(colors = brewer.pal(11,"RdBu")[2:1])(100)), density.info = "none", cexRow = 0.8, trace = "none", symkey = T, symbreaks = T, ColSideColors = up_all_L2FC$clusterColCor, srtCol = 45)
-dev.off()
+#dev.off()
 ```
 
 Order of clusters in heatmap is:
@@ -910,7 +1092,7 @@ CLIP_72h_3UTR_sum %>%
 ```
 
 
-Table S6 - CLIP targets
+Table S7 - CLIP targets
 ----------------------------------------------
 
 Rather than having all the 4h targets first, then 24h etc, will reorganise to be genomic order
@@ -943,7 +1125,7 @@ Darnell_4h_3UTR_targets %>%
   select(Gene_name, Gene_ID, sum_3UTR_4h, sum_3UTR_24h, sum_3UTR_72h, ends_with("90"), starts_with("CLIP")) %>% 
   mutate(across(starts_with("sum"), ~ if_else(is.na(.x), 0, .x))) %>% 
   mutate(across(starts_with("CLIP"), ~ if_else(is.na(.x), "Non-target", .x))) %>%
-  write_tsv("Supplementary_tables/TableS6_CLIP.txt")
+  write_tsv("Supplementary_tables/TableS7_CLIP.txt")
 ```
 
 
@@ -1018,6 +1200,43 @@ Expression_norm_per_kb <- CD4_72h_FPKM
 iCLIP_3UTR_hits <- Darnell_72h_3UTR_targets
 save(Expression_norm_per_kb, iCLIP_3UTR_hits, UTR_lengths, file = "CLIP_data/CLIP_72h_exMatch.RData")
 ```
+
+Check how well expression between the different timepoints/conditions correlates
+
+```{r}
+read_tsv("FPKM/iCLIP24h_genes.fpkm_table") %>% 
+  mutate(across(where(is.numeric), ~ log2(.x + 1e-8))) %>%
+  mutate(FPKM_24h = rowMeans(select(., is.numeric))) %>%
+  select(tracking_id, FPKM_24h) %>%
+  inner_join({
+    read_tsv("FPKM/CLIP4h_genes.fpkm_table") %>% 
+      mutate(across(where(is.numeric), ~ log2(.x + 1e-8))) %>%
+      mutate(FPKM_4h = rowMeans(select(., is.numeric))) %>%
+      select(tracking_id, FPKM_4h)
+  }) %>%
+  inner_join({
+    read_tsv("FPKM/CLIP72h_genes.fpkm_table") %>% 
+      mutate(across(where(is.numeric), ~ log2(.x + 1e-8))) %>%
+      mutate(FPKM_72h = rowMeans(select(., is.numeric))) %>%
+      select(tracking_id, FPKM_72h)
+  }) -> FPKM_all_CLIPdata
+
+
+```
+
+```{r fig.height=2.8, fig.width=3.2}
+FPKM_all_CLIPdata %>%
+  select(FPKM_4h, FPKM_24h, FPKM_72h) %>%
+  cor() %>%
+  pheatmap(
+    cluster_cols = F,
+    cluster_rows = F,
+    breaks = seq(-1,1, length.out = 101), 
+    display_numbers = T
+  )
+
+```
+
 
 
 Figure 2C-D - CLIP and ARE enrichment
@@ -1302,7 +1521,7 @@ read_tsv("GO_term_analysis/Revigo_all_clusters.tsv") %>%
 
 ```
 
-### Table S7 - gene set enrichment
+### Table S8 - gene set enrichment
 
 First write out table for supplementary (before re-ordering/filtering)
 
@@ -1311,7 +1530,7 @@ This will be combined with TRANSFAC output into a single table in Excel
 ```{r}
 Revigo_all_clusters %>%
   select(1,15,6,7,13,14,16:23) %>% 
-    write_tsv("Supplementary_tables/TableS7_GOallclusters.txt")
+    write_tsv("Supplementary_tables/TableS8_GOallclusters.txt")
 
 ```
 
@@ -1356,7 +1575,7 @@ ggsave("Figure_panels/Fig2F_TRANSFAC_cluster345.pdf")
 ```
 
 
-Table S5 - clusters
+Table S6 - clusters
 ==============================
 
 Want to include TATTTATT motifs in 3'UTR, and CLIP targets.
@@ -1399,7 +1618,7 @@ up_all_L2FC %>%
   mutate(row_id = row_number()) %>%
   arrange(match(row_id, up_all_hcCor$order)) %>%
   select(-row_id) %>%
-  write_tsv("Supplementary_tables/TableS5_clusters.txt")
+  write_tsv("Supplementary_tables/TableS6_clusters.txt")
 ```
 
 
@@ -1718,34 +1937,34 @@ plot_CLIP_profile("Slc38a2-201", zoom_max = 96691000, displayTATT = T, consPlot 
 ggsave("Figure_panels/Fig5C_Slc38a2CLIP_3UTR.pdf")
 ```
 
-Figure S4E
+Figure S5E
 ------------
 
 ### Gzmb
 
 ```{r fig.height=2, fig.width=4}
 plot_CLIP_profile("Gzmb-201")
-ggsave("Figure_panels/FigS4E_GzmbCLIP_complete.pdf")
+ggsave("Figure_panels/FigS5E_GzmbCLIP_complete.pdf")
 plot_CLIP_profile("Gzmb-201", zoom_max = 56259500, displayTATT = T, consPlot = T)
-ggsave("Figure_panels/FigS4E_GzmbCLIP_3UTR.pdf")
+ggsave("Figure_panels/FigS5E_GzmbCLIP_3UTR.pdf")
 ```
 
 ### Tbx21
 
 ```{r fig.height=2, fig.width=4}
 plot_CLIP_profile("Tbx21-201")
-ggsave("Figure_panels/FigS4E_Tbx21CLIP_complete.pdf")
+ggsave("Figure_panels/FigS5E_Tbx21CLIP_complete.pdf")
 plot_CLIP_profile("Tbx21-201", zoom_max = 97099000, displayTATT = T, consPlot = T)
-ggsave("Figure_panels/FigS4E_Tbx21CLIP_3UTR.pdf")
+ggsave("Figure_panels/FigS5E_Tbx21CLIP_3UTR.pdf")
 ```
 
 ### Hopx
 
 ```{r fig.height=2, fig.width=4}
 plot_CLIP_profile("Hopx-201")
-ggsave("Figure_panels/FigS4E_HopxCLIP_complete.pdf")
+ggsave("Figure_panels/FigS5E_HopxCLIP_complete.pdf")
 plot_CLIP_profile("Hopx-201", zoom_max = 77088000, displayTATT = T, consPlot = T)
-ggsave("Figure_panels/FigS4E_HopxCLIP_3UTR.pdf")
+ggsave("Figure_panels/FigS5E_HopxCLIP_3UTR.pdf")
 ```
 
 
@@ -1850,7 +2069,7 @@ Plot heatmap:
 ```{r fig.height=15, fig.width=4.5}
 sym_breaks <- seq(-4.6, 4.6, length.out = 401)
 
-pdf("Figure_panels/Fig3A_4A_RNA_hm.pdf", height = 15, width = 4.5)
+#pdf("Figure_panels/Fig3A_4A_RNA_hm.pdf", height = 15, width = 4.5)
 Metabolism_RNA_zscores %>%
   pheatmap(cluster_rows = F,
            cluster_cols = F,
@@ -1869,7 +2088,7 @@ Metabolism_RNA_zscores %>%
            fontsize_number = 14,
            annotation_legend = F,
            gaps_row = c(21, 28, 31, 41, 47, 69, 78, 83, 88, 92))
-dev.off()
+#dev.off()
 ```
 
 
@@ -1911,7 +2130,7 @@ all_metabolomics_LCMS %>%
 Plot data:
 
 ```{r fig.height=8, fig.width=5.5}
-pdf("Figure_panels/Fig6A_met_hm.pdf", height=8, width =5.5, useDingbats = F)
+#pdf("Figure_panels/Fig6A_met_hm.pdf", height=8, width =5.5, useDingbats = F)
 all_metabolites_total_scaled %>%
   pheatmap(cluster_rows = F,
            cluster_cols = F,
@@ -1923,24 +2142,24 @@ all_metabolites_total_scaled %>%
              Ctrl_mean = brewer.pal(9,"Blues")
              ),
            gaps_row = c(9,14,29,39, 49))
-dev.off()
+#dev.off()
 ```
 
 Calculate fold change (non-log transformed) and export for supplementary table
 
 
-### Table S9 - LC-MS
+### Table S10 - LC-MS
 
 ```{r}
 all_metabolomics_LCMS %>%
   mutate(Ctrl_mean_lin = rowMeans(select(all_metabolomics_LCMS, starts_with("WT")))) %>%
   mutate(dKO_mean_lin = rowMeans(select(all_metabolomics_LCMS, starts_with("KO")))) %>%
   mutate(fold_change = dKO_mean_lin/Ctrl_mean_lin) %>%
-  write_tsv("Supplementary_tables/TableS9_LCMS.txt") # then delete the columns I don't want in excel
+  write_tsv("Supplementary_tables/TableS10_LCMS.txt") # then delete the columns I don't want in excel
 ```
 
 
-Figure S3F - LC-MS
+Figure S4A - LC-MS
 ===================
 
 For some of the glutamine/TCA related metabolites, I will also include bar plots (with points) to make trend clearer
@@ -1960,7 +2179,7 @@ all_metabolomics_LCMS %>%
     scale_y_continuous(expand = expansion(mult = c(0,0.1))) +
     labs(x = NULL, y = "Relative Abundance") +
     theme(panel.background = element_blank(), plot.background = element_blank(), legend.key = element_blank(), legend.background = element_blank())
-ggsave("Figure_panels/FigS3F_LCMS_bar.pdf")
+ggsave("Figure_panels/FigS4A_LCMS_bar.pdf")
 ```
 
 
@@ -1996,6 +2215,63 @@ Metabolism_RNA_hm %>%
 
 ggsave("Figure_panels/Fig3B_4B_dotplot.pdf", useDingbats = F)
 
+```
+
+Figure S3F: sKO vs dKO for metabolic genes
+===========================================
+
+Heatmap showing z-scores for a selection of metabolic genes in sKO and dKO cells
+
+```{r}
+tibble(Gene = c("Myc", "Hif1a", "Hk2", "Pfkfb3", "Slc2a1", "Slc2a3", "Pfkp", "Mthfd2", "Mat2a", "Slc38a2", "Gls", "Glud1", "Idh3a", "Ogdh", "Mdh2", "Got1", "Acly", "Pank3", "Hmgcr", "Fasn")) %>%
+  left_join(sdKO_zscores_pvals) -> sdKO_metabolism
+```
+```{r}
+sdKO_metabolism %>%
+  column_to_rownames("Gene") %>%
+  select(starts_with("z.score")) -> sdKO_met_hm
+
+sdKO_metabolism %>%
+  mutate(TTP_sig = case_when(
+    deseq_padj_TTP < 0.05 ~ "***",
+    deseq_pval_TTP < 0.05 ~ "**",
+    deseq_pval_TTP < 0.1 ~ "*",
+    TRUE ~ ""
+  )) %>%
+  mutate(Tis11b_sig = case_when(
+    deseq_padj_Tis11b < 0.05 ~ "***",
+    deseq_pval_Tis11b < 0.05 ~ "**",
+    deseq_pval_Tis11b < 0.1 ~ "*",
+    TRUE ~ ""
+  )) %>%
+  mutate(dKO_sig = case_when(
+    deseq_padj_dKO < 0.05 ~ "***",
+    deseq_pval_dKO < 0.05 ~ "**",
+    deseq_pval_dKO < 0.1 ~ "*",
+    TRUE ~ ""
+  )) %>%
+  column_to_rownames("Gene") %>%
+  select(ends_with("sig")) -> sdKO_met_pval
+  
+```
+
+Plot heatmap:
+
+```{r fig.height=4, fig.width=3.5}
+sdKO_breaks = seq(-max(abs(sdKO_met_hm)), max(abs(sdKO_met_hm)), length.out = 401)
+
+#pdf("Figure_panels/FigS3F_sdKO_heatmap_metabolism.pdf", height = 4, width = 3.5)
+sdKO_met_hm %>%
+  pheatmap(cluster_rows = F,
+           cluster_cols = F,
+           breaks = sdKO_breaks, 
+           angle_col = 45, 
+           fontsize_row = 10,
+           color = c(colorRampPalette(colors = brewer.pal(11,"RdBu")[11:10])(100),colorRampPalette(colors = brewer.pal(11,"RdBu")[10:2])(200),colorRampPalette(colors = brewer.pal(11,"RdBu")[2:1])(100)), 
+           display_numbers = sdKO_met_pval, 
+           fontsize_number = 14,
+           annotation_legend = F)
+#dev.off()
 ```
 
 Figure 5G-I - rate-limiting genes
@@ -2156,7 +2432,7 @@ rateLim_genes_long %>%
   mutate(padj = p.adjust(p, method ="fdr"))
 ```
 
-Table S8 - rate-limiting genes
+Table S9 - rate-limiting genes
 ------------------------------
 
 Export for supplement. This will be combined with the references supporting definition of rate-limiting genes in Excel.
@@ -2173,7 +2449,7 @@ rateLim_genes %>%
   mutate(iCLIP_24h = Gene_ID %in% iCLIP_24h_3UTR_targets) %>%
   mutate(CLIP_72h = Gene_ID %in% Darnell_72h_3UTR_targets) %>%
   left_join(rateLim_TATTTATT, by = c("Gene_ID" = "Gene")) %>%
-  write_tsv("Supplementary_tables/TableS8_rateLim.txt")
+  write_tsv("Supplementary_tables/TableS9_rateLim.txt")
 
 ```
 
@@ -2304,13 +2580,13 @@ plot_abundance_with_labelled("Suc", title = "Succinate") -> pGlcSuc
 
 ggarrange(pGlcPyr, pGlcLac, pGlcSer, pGlcGlu, pGlcAkg, pGlcMal, pGlcFum, pGlcAsp, pGlcCit, pGlcSuc, nrow = 3)
 
-pdf("Figure_panels/Fig6B_glucLab.pdf", height = 3, width = 5.5)
+#pdf("Figure_panels/Fig6B_glucLab.pdf", height = 3, width = 5.5)
 ggarrange(pGlcPyr, pGlcLac, pGlcSer, nrow = 1)
-dev.off()
+#dev.off()
 ```
 
 
-Figure 6E-F; S3G: glutamine tracing
+Figure 6E-F; S4B: glutamine tracing
 ====================================
 
 Read in data
@@ -2365,9 +2641,9 @@ plot_abundance_with_labelled("Asp", ion_data = Glutamine_tracing_ion_counts, lab
 plot_abundance_with_labelled("Cit", ion_data = Glutamine_tracing_ion_counts, labelled_data = Glutamine_tracing_labelled_ion_counts, colour = "dodgerblue3", title = "Citrate") -> pGluCit
 plot_abundance_with_labelled("Suc", ion_data = Glutamine_tracing_ion_counts, labelled_data = Glutamine_tracing_labelled_ion_counts, colour = "dodgerblue3", title = "Succinate") -> pGluSuc
 
-pdf("Figure_panels/Fig6E_glucglut_tracing.pdf", height = 10, width = 8)
+#pdf("Figure_panels/Fig6E_glucglut_tracing.pdf", height = 10, width = 8)
 ggarrange(pGlcGlu, pGluGlu, pGlcAkg, pGluAkg, pGlcFum, pGluFum, pGlcMal, pGluMal, pGlcAsp, pGluAsp, pGlcCit, pGluCit, pGlcSuc, pGluSuc, ncol = 4)
-dev.off()
+#dev.off()
 ```
 
 Figure 6F - aKG:succinate ratios
@@ -2431,7 +2707,7 @@ ggsave("Figure_panels/Fig6F_aKG_succ_ratio.pdf")
 
 ```
 
-MIDs for selected metabolites (S3G)
+MIDs for selected metabolites (S4B)
 -----------------------------------
 
 Will just plot M3-M5 as these are the interesting ones
@@ -2452,11 +2728,11 @@ read_tsv("metabolomics/glutamine_tracing/MID_selected.txt") %>%
     theme_bw() +
     scale_fill_manual(values = c("grey60", "white")) +
     scale_shape_manual(values = c(16, 21))
-ggsave("Figure_panels/FigS3G_TCA_MID.pdf")
+ggsave("Figure_panels/FigS4B_TCA_MID.pdf")
 ```
 
 
-Table S10 - tracing experiments
+Table S11 - tracing experiments
 -------------------------------
 
 Export data for supplementary table:
@@ -2502,7 +2778,7 @@ read_tsv("metabolomics/glucose_tracing/Norm_ion_counts.txt") %>%
       left_join(select(glut_labelled_stats, Metabolite, p), by = "Metabolite", suffix = c("_total", "_labelled")) %>%
       select(Metabolite, ends_with("counts"), p_total, everything())
   }, by = "Metabolite", suffix = c("_glucose", "_glutamine")) %>%
-  write_tsv("Supplementary_tables/TableS10_allLabelling.txt")
+  write_tsv("Supplementary_tables/TableS11_allLabelling.txt")
 
 ```
 Means for control and KO in each metric calculated later in Excel.
@@ -2769,8 +3045,10 @@ Stats from DESeq2 added in Illustrator
 Figure 7G - Th1 heatmap
 ==========================
 
+Also include TFs that came up in the CD8 manuscript
+
 ```{r}
-tibble(Gene = c("Tbx21", "Eomes", "Runx3", "Zbtb7b", "Stat1", "Stat4", "Irf4", "Notch1", "Notch2", "Nfatc1", "Nfatc2", "Nfatc3", "Jun", "Fos", "Mitf", "Hopx", "Prdm1")) %>%
+tibble(Gene = c("Tbx21", "Eomes", "Runx3", "Stat1", "Stat4", "Irf4", "Irf8", "Notch1", "Notch2", "Nfatc1", "Nfatc2", "Nfatc3", "Jun", "Fos", "Mitf", "Hopx", "Prdm1", "Nfkb1", "Nfkb2", "Rel")) %>%
   mutate(Nascent_zscore = all_L2FC_norm$Nascent_zscore[match(Gene, all_L2FC_norm$Gene)]) %>%
   mutate(Stability_zscore = all_L2FC_norm$Stability_zscore[match(Gene, all_L2FC_norm$Gene)]) %>%
   mutate(RNA_zscore = all_L2FC_norm$RNA_zscore[match(Gene, all_L2FC_norm$Gene)]) %>%
@@ -2850,8 +3128,8 @@ Th1_hm %>%
 
 Plot heatmap:
 
-```{r fig.height=4.5, fig.width=4.5}
-pdf("Figure_panels/Fig7G_Th1hm.pdf", height = 4.5, width = 4.5)
+```{r fig.height=5, fig.width=4.5}
+#pdf("Figure_panels/Fig7G_Th1hm.pdf", height = 5, width = 4.5)
 Th1_zscores %>%
   pheatmap(cluster_rows = F,
            cluster_cols = F,
@@ -2869,7 +3147,7 @@ Th1_zscores %>%
            ),
            fontsize_number = 14,
            annotation_legend = F)
-dev.off()
+#dev.off()
 ```
 
 Figure 7H-K: Influenza
